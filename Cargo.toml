@@ -1,0 +1,16 @@
+[package]
+name = "w25n512gv"
+version = "0.1.0"
+edition = "2021"
+authors = ["Troy Neubauer <troyneubauer@gmail.com>"]
+repository = "https://github.com/ERFSEDS/w25n512gv"
+readme = "README.md"
+documentation = "https://docs.rs/w25n512gv/"
+description = "Embedded driver for the SPI based w25n512gv flash chip"
+license = "MIT"
+keywords = ["flash-chip", "embedded", "hardware"]
+categories = ["embedded"]
+
+[dependencies]
+embedded-hal = "0.2.7"
+rumio = "0.2.0"

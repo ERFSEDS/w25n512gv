@@ -85,94 +85,94 @@ pub(crate) struct Commands;
 #[allow(non_camel_case_types, dead_code)]
 impl Commands {
     const UNIQUE_ID: u8 = 0x4B;
-    const Device_RESET: u8 = 0xFF;
+    const DEVICE_RESET: u8 = 0xFF;
 
     /// Dummy EFh AAh 20h
     const JEDEC_ID: u8 = 0x9F;
 
     // / 05h SR Addr S7-0 S7-0 S7-0 S7-0 S7-0 S7-0 S7-0
-    const Read_Status_Register: u8 = 0x0F;
+    const READ_STATUS_REGISTER: u8 = 0x0F;
 
     /// / 01h SR Addr S7-0
-    const Write_Status_Register: u8 = 0x1F;
+    const WRITE_STATUS_REGISTER: u8 = 0x1F;
 
-    const Write_Enable: u8 = 0x06;
+    const WRITE_ENABLE: u8 = 0x06;
 
-    const Write_Disable: u8 = 0x04;
+    const WRITE_DISABLE: u8 = 0x04;
 
     /// LBA LBA PBA PBA
-    const BB_Management_Swap_Blocks: u8 = 0xA1;
+    const BB_MANAGEMENT_SWAP_BLOCKS: u8 = 0xA1;
 
     /// Dummy LBA0 LBA0 PBA0 PBA0 LBA1 LBA1 PBA1
-    const Read_BBM_LUT: u8 = 0xA5;
+    const READ_BBM_LUT: u8 = 0xA5;
 
     /// Dummy PA15-8 PA7-0
-    const Last_ECC_failure_Page_Address: u8 = 0xA9;
+    const LAST_ECC_FAILURE_PAGE_ADDRESS: u8 = 0xA9;
 
     /// Dummy PA15-8 PA7-0
-    const Block_Erase: u8 = 0xD8;
+    const BLOCK_ERASE: u8 = 0xD8;
 
     /// CA15-8 CA7-0 Data-0 Data-1 Data-2 Data-3 Data-4 Data-5
-    const Program_Data_Load_Reset_Buffer: u8 = 0x02;
+    const PROGRAM_DATA_LOAD_RESET_BUFFER: u8 = 0x02;
 
     /// CA15-8 CA7-0 Data-0 Data-1 Data-2 Data-3 Data-4 Data-5
-    const Random_Program_Data_Load: u8 = 0x84;
+    const RANDOM_PROGRAM_DATA_LOAD: u8 = 0x84;
 
     /// CA15-8 CA7-0 Data-0 / 4 Data-1 / 4 Data-2 / 4 Data-3 / 4 Data-4 / 4 Data-5 / 4
-    const Quad_Program_Data_Load_Reset_Buffer: u8 = 0x32;
+    const QUAD_PROGRAM_DATA_LOAD_RESET_BUFFER: u8 = 0x32;
 
     /// CA15-8 CA7-0 Data-0 / 4 Data-1 / 4 Data-2 / 4 Data-3 / 4 Data-4 / 4 Data-5 / 4
-    const Random_Quad_Program_Data_Load: u8 = 0x34;
+    const RANDOM_QUAD_PROGRAM_DATA_LOAD: u8 = 0x34;
 
     /// Dummy PA15-8 PA7-0
-    const Program_Execute: u8 = 0x10;
+    const PROGRAM_EXECUTE: u8 = 0x10;
 
     /// Dummy PA15-8 PA7-0
-    const Page_Data_Read: u8 = 0x13;
+    const PAGE_DATA_READ: u8 = 0x13;
 
     /// CA15-8 CA7-0 Dummy D7-0 D7-0 D7-0 D7-0 D7-0
-    const Read: u8 = 0x03;
+    const READ: u8 = 0x03;
 
     /// CA15-8 CA7-0 Dummy D7-0 D7-0 D7-0 D7-0 D7-0
-    const Fast_Read: u8 = 0x0B;
+    const FAST_READ: u8 = 0x0B;
 
     /// CA15-8 CA7-0 Dummy Dummy Dummy D7-0 D7-0 D7-0
-    const Fast_Read_4_Byte_Address: u8 = 0x0C;
+    const FAST_READ_4_BYTE_ADDRESS: u8 = 0x0C;
 
     /// CA15-8 CA7-0 Dummy D7-0 / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2
-    const Fast_Read_Dual_Output: u8 = 0x3B;
+    const FAST_READ_DUAL_OUTPUT: u8 = 0x3B;
 
     /// CA15-8 CA7-0 Dummy Dummy Dummy D7-0 / 2 D7-0 / 2 D7-0 / 2
-    const Fast_Read_Dual_Output_with_4_Byte_Address: u8 = 0x3C;
+    const FAST_READ_DUAL_OUTPUT_WITH_4_BYTE_ADDRESS: u8 = 0x3C;
 
     /// CA15-8 CA7-0 Dummy D7-0 / 4 D7-0 / 4 D7-0 / 4 D7-0 / 4 D7-0 / 4
-    const Fast_Read_Quad_Output: u8 = 0x6B;
+    const FAST_READ_QUAD_OUTPUT: u8 = 0x6B;
 
     /// 6Ch CA15-8 CA7-0 Dummy Dummy Dummy D7-0 / 4 D7-0 / 4 D7-0 / 4
-    const Fast_Read_Quad_Output_with_4_Byte_Address: u8 = 0x6C;
+    const FAST_READ_QUAD_OUTPUT_WITH_4_BYTE_ADDRESS: u8 = 0x6C;
 
     /// CA15-8 / 2 CA7-0 / 2 Dummy / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2
-    const Fast_Read_Dual_I_O: u8 = 0xBB;
+    const FAST_READ_DUAL_I_O: u8 = 0xBB;
 
     /// CA15-8 / 2 CA7-0 / 2 Dummy / 2 Dummy / 2 Dummy / 2 D7-0 / 2 D7-0 / 2 D7-0 / 2
-    const Fast_Read_Dual_I_O_with_4_Byte_Address: u8 = 0xBC;
+    const FAST_READ_DUAL_I_O_WITH_4_BYTE_ADDRESS: u8 = 0xBC;
 
     /// CA15-8 / 4 CA7-0 / 4 Dummy / 4 Dummy / 4 D7-0 / 4 D7-0 / 4 D7-0 / 4 D7-0 / 4
-    const Fast_Read_Quad_I_O: u8 = 0xEB;
+    const FAST_READ_QUAD_I_O: u8 = 0xEB;
 
     /// CA15-8 / 4 CA7-0 / 4 Dummy / 4 Dummy / 4 Dummy / 4 Dummy / 4 Dummy / 4 D7-0 / 4
-    const Fast_Read_Quad_I_O_with_4_Byte_Address: u8 = 0xEC;
+    const FAST_READ_QUAD_I_O_WITH_4_BYTE_ADDRESS: u8 = 0xEC;
 
-    const Deep_Power_Down: u8 = 0xB9;
+    const DEEP_POWER_DOWN: u8 = 0xB9;
 
-    const Release_Power_Down: u8 = 0xAB;
+    const RELEASE_POWER_DOWN: u8 = 0xAB;
 
     /// Chip Erase C7h/60h
-    const Chip_Erase: u8 = 0xC7;
+    const CHIP_ERASE: u8 = 0xC7;
 
-    const Enable_Reset: u8 = 0x66;
+    const ENABLE_RESET: u8 = 0x66;
 
-    const Reset_Device: u8 = 0x99;
+    const RESET_DEVICE: u8 = 0x99;
 }
 
 impl<SPI, CS> SpiInterface<SPI, CS> {}

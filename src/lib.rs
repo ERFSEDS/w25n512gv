@@ -134,31 +134,66 @@ where
         Ok(())
     }
 
-    pub fn transfer(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
+    /// Performs a raw SPI transfer with the flash chip, writing the bits inside `buf` and
+    /// immediately reading the result from the flash chip into `buf`
+    pub(crate) fn transfer(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
         self.cs_enable()?;
         self.spi.transfer(&mut buf[..])?;
         self.cs_disable()?;
         Ok(())
     }
 
+    /// Reads a fixed amount of bytes by executing `instruction` on the flash chip with `params`
     pub fn read<const PARAMS: usize, const DUMMY_BYTES: usize, const RESULTS: usize>(
         &mut self,
         instruction: u8,
         params: [u8; PARAMS],
     ) -> Result<[u8; RESULTS], Error<SE, PE>> {
-        // We wont use over 16 bytes for reading a set thing
-        let mut buf = [0u8; 16];
-        buf[0] = instruction;
-        for (i, &param) in params.iter().enumerate() {
-            buf[i + 1] = param;
+        let mut header = heapless::Vec::<u8, 16>::new();
+        header.push(instruction).unwrap();
+        for &param in params.iter() {
+            header.push(param).unwrap();
+        }
+        for _ in 0..DUMMY_BYTES {
+            header.push(0).unwrap();
+        }
+        for _ in 0..RESULTS {
+            header.push(0).unwrap();
         }
 
-        self.transfer(&mut buf)?;
+        self.transfer(&mut header)?;
 
         let mut dst = [0u8; RESULTS];
         let dst_start = 1 + PARAMS + DUMMY_BYTES;
-        dst.copy_from_slice(&buf[dst_start..dst_start + RESULTS]);
+        dst.copy_from_slice(&header[dst_start..dst_start + RESULTS]);
         Ok(dst)
+    }
+
+    /// Reads a dynamic amount of bytes by executing `instruction` on the flash chip with `params`
+    pub fn read_unbounded<const PARAMS: usize, const DUMMY_BYTES: usize>(
+        &mut self,
+        instruction: u8,
+        params: [u8; PARAMS],
+        buf: &mut [u8],
+    ) -> Result<(), Error<SE, PE>> {
+        let mut header = heapless::Vec::<u8, 16>::new();
+        header.push(instruction).unwrap();
+        for &param in params.iter() {
+            header.push(param).unwrap();
+        }
+        for _ in 0..DUMMY_BYTES {
+            header.push(0).unwrap();
+        }
+
+        self.cs_enable()?;
+        // Write instruction information
+        self.spi.write(&header)?;
+        // FIXME:
+        // Make sure we dont miss bits here! If the function calls too slowly, that may happen!
+        self.spi.transfer(&mut buf[..])?;
+        self.cs_disable()?;
+
+        Ok(())
     }
 
     pub fn cs_disable(&mut self) -> Result<(), Error<SE, PE>> {

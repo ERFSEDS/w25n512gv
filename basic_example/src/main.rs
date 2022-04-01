@@ -1,9 +1,12 @@
 #![no_std]
 #![no_main]
 
+use core::cell::UnsafeCell;
 use core::fmt::Write;
+use core::mem::MaybeUninit;
 
 use embedded_hal::spi::{Mode, Phase, Polarity};
+use hal::pac::USART2;
 
 use crate::hal::{pac, prelude::*, spi};
 use cortex_m_rt::entry;
@@ -11,6 +14,41 @@ use panic_halt as _;
 use stm32f4xx_hal as hal;
 
 use w25n512gv::W25n512gv;
+
+static WRITER: Writer = Writer(UnsafeCell::new(MaybeUninit::uninit()));
+
+struct Writer(UnsafeCell<MaybeUninit<hal::serial::Tx<USART2>>>);
+
+unsafe impl Sync for Writer {}
+unsafe impl Send for Writer {}
+
+/// # Safety
+/// This function must only be called after `WRITER` is initialized
+unsafe fn get_writer() -> &'static mut hal::serial::Tx<USART2> {
+    unsafe { (*WRITER.0.get()).assume_init_mut() }
+}
+
+macro_rules! println {
+    () => {{
+        let writer = unsafe { get_writer() };
+        writeln!(writer);
+    }};
+    ($($arg:tt)*) => {{
+        let writer = unsafe { get_writer() };
+        writeln!(writer, $($arg)*);
+    }};
+}
+
+macro_rules! print {
+    () => {{
+        let writer = unsafe { get_writer() };
+        write!(writer);
+    }};
+    ($($arg:tt)*) => {{
+        let writer = unsafe { get_writer() };
+        write!(writer, $($arg)*);
+    }};
+}
 
 #[entry]
 fn main() -> ! {
@@ -26,7 +64,9 @@ fn main() -> ! {
 
     let tx_pin = gpioa.pa2.into_alternate();
 
-    let mut serial = dp.USART2.tx(tx_pin, 9600.bps(), &clocks).unwrap();
+    let serial = dp.USART2.tx(tx_pin, 9600.bps(), &clocks).unwrap();
+    let writer = WRITER.0.get();
+    unsafe { writer.write(MaybeUninit::new(serial)) };
 
     // "High-Speed"/H_ SPI for flash chip:
     // SCK PC10
@@ -62,20 +102,20 @@ fn main() -> ! {
         &clocks,
     );
 
-    writeln!(serial, "\n\n========================================\n").unwrap();
-    writeln!(serial, "Starting initialization.").unwrap();
-
-    let (mut flash, id) = W25n512gv::new(spi, flash_cs /*, &mut delay*/)
-        .map_err(|_| {
-            writeln!(serial, "Barometer failed to intialize.").unwrap();
-        })
-        .unwrap();
+    println!("\n\n========================================\n");
+    println!("Starting initialization.");
 
     delay.delay_ms(100u32);
 
-    writeln!(serial, "Flash initialized. {id:?}").unwrap();
+    let mut flash = W25n512gv::new(spi, flash_cs /*, &mut delay*/)
+        .map_err(|e| {
+            println!("Flash chip failed to intialize. {e:?}");
+        })
+        .unwrap();
 
-    writeln!(serial, "Initialized.").unwrap();
+    println!("Initialized.");
+    let id = flash.read_jedec_id().unwrap();
+    println!("Id {id:?}");
 
     loop {
         /*let sample = ms6511

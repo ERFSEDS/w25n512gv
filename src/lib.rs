@@ -14,6 +14,9 @@ pub enum Error<SpiError, PinError> {
     Spi(SpiError),
     /// Chip select pin set error
     Pin(PinError),
+
+    /// Wrong Jedec id detected
+    WrongJedecId(JedecId),
 }
 
 impl<SpiError, PinError> From<SpiError> for Error<SpiError, PinError> {
@@ -108,15 +111,61 @@ where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    pub fn new(spi: SPI, cs: CS) -> Result<(Self, [u8; 5]), Error<SE, PE>> {
+    pub fn new(spi: SPI, cs: CS) -> Result<Self, Error<SE, PE>> {
         let mut dev = Self {
             bus: SpiInterface { spi, cs },
         };
-        //let jedec: [u8; 3] = dev.bus.read::<0, 1, 3>(Commands::JEDEC_ID, [])?;
-        let mut buf = [Commands::JEDEC_ID, 0, 0, 0, 0];
-        dev.bus.transfer(&mut buf)?;
+        /*let jedec = dev.read_jedec_id()?;
+        if jedec.manufacturer_id != 0xEF {
+            Err(Error::WrongJedecId(jedec))
+        } else if jedec.device_id != [0xAA, 0x20] {
+            Err(Error::WrongJedecId(jedec))
+        } else {
+            Ok(dev)
+        }*/
+        Ok(dev)
+    }
 
-        Ok((dev, buf))
+    pub fn read_jedec_id(&mut self) -> Result<JedecId, Error<SE, PE>> {
+        let jedec: [u8; 3] = self.bus.execute::<0, 1, 3>(Commands::JEDEC_ID, [])?;
+        Ok(JedecId {
+            manufacturer_id: jedec[0],
+            device_id: [jedec[1], jedec[2]],
+        })
+    }
+
+    pub fn read_regester(&mut self, register: u8) -> Result<u8, Error<SE, PE>> {
+        let value: [u8; 1] = self
+            .bus
+            .execute::<1, 0, 1>(Commands::READ_STATUS_REGISTER, [register])?;
+        Ok(value[0])
+    }
+
+    pub fn write_register(&mut self, register: u8, value: u8) -> Result<(), Error<SE, PE>> {
+        let _: [u8; 0] = self
+            .bus
+            .execute::<2, 0, 0>(Commands::WRITE_STATUS_REGISTER, [register, value])?;
+        Ok(())
+    }
+
+    pub fn disable_write(&mut self) -> Result<(), Error<SE, PE>> {
+        let _: [u8; 0] = self.bus.execute::<0, 0, 0>(Commands::WRITE_DISABLE, [])?;
+        Ok(())
+    }
+
+    pub fn enable_write(&mut self) -> Result<(), Error<SE, PE>> {
+        let _: [u8; 0] = self.bus.execute::<0, 0, 0>(Commands::WRITE_ENABLE, [])?;
+        Ok(())
+    }
+
+    // Skipped bad block managment through block erase not yet implemented
+
+    /// Writes `buf` into the flash chip's internal memory buffer.
+    /// This is the first step in writing data to the persistent memory in the flash chip
+    /// The next step is issuing a program execute intsrution which will transfer the data in the
+    /// memory buffer to a specific page on the flash memory
+    pub fn load_program_data(&mut self, buf: &[u8]) -> Result<(), Error<SE, PE>> {
+        Ok(())
     }
 }
 
@@ -125,47 +174,42 @@ where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
+    /// Performs a raw SPI write to the flash chip with `buf`
     pub fn write<const N: usize>(&mut self, buf: [u8; N]) -> Result<(), Error<SE, PE>> {
-        self.cs_enable()?;
-
-        self.spi.write(&buf)?;
-
-        self.cs_disable()?;
+        {
+            self.cs_enable()?;
+            self.spi.write(&buf)?;
+            self.cs_disable()?;
+        }
         Ok(())
     }
 
-    /// Performs a raw SPI transfer with the flash chip, writing the bits inside `buf` and
-    /// immediately reading the result from the flash chip into `buf`
+    /// Performs a raw SPI transfer with the flash chip, sending it the bits inside `buf` and
+    /// immediately writing recieved bits from the flash chip into `buf`
     pub(crate) fn transfer(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
-        self.cs_enable()?;
-        self.spi.transfer(&mut buf[..])?;
-        self.cs_disable()?;
+        {
+            self.cs_enable()?;
+            self.spi.transfer(&mut buf[..])?;
+            self.cs_disable()?;
+        }
         Ok(())
     }
 
-    /// Reads a fixed amount of bytes by executing `instruction` on the flash chip with `params`
-    pub fn read<const PARAMS: usize, const DUMMY_BYTES: usize, const RESULTS: usize>(
+    /// Executs `instruction` on the flash chip with `params`, returning the requesed number of
+    /// result bytes.
+    pub fn execute<const PARAMS: usize, const DUMMY_BYTES: usize, const RESULTS: usize>(
         &mut self,
         instruction: u8,
         params: [u8; PARAMS],
     ) -> Result<[u8; RESULTS], Error<SE, PE>> {
-        let mut header = heapless::Vec::<u8, 16>::new();
-        header.push(instruction).unwrap();
-        for &param in params.iter() {
-            header.push(param).unwrap();
-        }
-        for _ in 0..DUMMY_BYTES {
-            header.push(0).unwrap();
-        }
-        for _ in 0..RESULTS {
-            header.push(0).unwrap();
-        }
+        let mut header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, RESULTS);
 
+        // `Self::transfer` manages CS for us
         self.transfer(&mut header)?;
 
+        let len = header.len();
         let mut dst = [0u8; RESULTS];
-        let dst_start = 1 + PARAMS + DUMMY_BYTES;
-        dst.copy_from_slice(&header[dst_start..dst_start + RESULTS]);
+        dst.copy_from_slice(&header[len - RESULTS..]);
         Ok(dst)
     }
 
@@ -176,32 +220,66 @@ where
         params: [u8; PARAMS],
         buf: &mut [u8],
     ) -> Result<(), Error<SE, PE>> {
+        let header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, 0);
+        {
+            self.cs_enable()?;
+            self.spi.write(&header)?;
+            // FIXME:
+            // Make sure we dont miss bits here! If the function calls too slowly, that may happen!
+            self.spi.transfer(&mut buf[..])?;
+            self.cs_disable()?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes a dynamic amount of bytes by executing `instruction` on the flash chip with `params`
+    pub fn write_unbounded<const PARAMS: usize, const DUMMY_BYTES: usize>(
+        &mut self,
+        instruction: u8,
+        params: [u8; PARAMS],
+        buf: &[u8],
+    ) -> Result<(), Error<SE, PE>> {
+        let header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, 0);
+
+        {
+            self.cs_enable()?;
+            self.spi.write(&header)?;
+            // FIXME:
+            // Make sure we dont miss bits here! If the function calls too slowly, that may happen!
+            self.spi.write(buf)?;
+            self.cs_disable()?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn cs_disable(&mut self) -> Result<(), Error<SE, PE>> {
+        self.cs.set_high().map_err(|pe| Error::Pin(pe))
+    }
+
+    pub(crate) fn cs_enable(&mut self) -> Result<(), Error<SE, PE>> {
+        self.cs.set_low().map_err(|pe| Error::Pin(pe))
+    }
+
+    pub(crate) fn prep_header<const PARAMS: usize, const DUMMY_BYTES: usize>(
+        instruction: u8,
+        params: [u8; PARAMS],
+        additional_bytes: usize,
+    ) -> heapless::Vec<u8, 16> {
         let mut header = heapless::Vec::<u8, 16>::new();
         header.push(instruction).unwrap();
+
         for &param in params.iter() {
             header.push(param).unwrap();
         }
         for _ in 0..DUMMY_BYTES {
             header.push(0).unwrap();
         }
-
-        self.cs_enable()?;
-        // Write instruction information
-        self.spi.write(&header)?;
-        // FIXME:
-        // Make sure we dont miss bits here! If the function calls too slowly, that may happen!
-        self.spi.transfer(&mut buf[..])?;
-        self.cs_disable()?;
-
-        Ok(())
-    }
-
-    pub fn cs_disable(&mut self) -> Result<(), Error<SE, PE>> {
-        self.cs.set_high().map_err(|pe| Error::Pin(pe))
-    }
-
-    pub fn cs_enable(&mut self) -> Result<(), Error<SE, PE>> {
-        self.cs.set_low().map_err(|pe| Error::Pin(pe))
+        for _ in 0..additional_bytes {
+            header.push(0).unwrap();
+        }
+        header
     }
 }
 
@@ -305,4 +383,10 @@ impl Commands {
     const ENABLE_RESET: u8 = 0x66;
 
     const RESET_DEVICE: u8 = 0x99;
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct JedecId {
+    pub manufacturer_id: u8,
+    pub device_id: [u8; 2],
 }

@@ -10,10 +10,9 @@ use hal::pac::USART2;
 
 use crate::hal::{pac, prelude::*, spi};
 use cortex_m_rt::entry;
-use panic_halt as _;
 use stm32f4xx_hal as hal;
 
-use w25n512gv::W25n512gv;
+use w25n512gv::{regs, Addresses, W25n512gv};
 
 static WRITER: Writer = Writer(UnsafeCell::new(MaybeUninit::uninit()));
 
@@ -31,22 +30,22 @@ unsafe fn get_writer() -> &'static mut hal::serial::Tx<USART2> {
 macro_rules! println {
     () => {{
         let writer = unsafe { get_writer() };
-        writeln!(writer);
+        writeln!(writer).unwrap();
     }};
     ($($arg:tt)*) => {{
         let writer = unsafe { get_writer() };
-        writeln!(writer, $($arg)*);
+        writeln!(writer, $($arg)*).unwrap();
     }};
 }
 
 macro_rules! print {
     () => {{
         let writer = unsafe { get_writer() };
-        write!(writer);
+        write!(writer).unwrap();
     }};
     ($($arg:tt)*) => {{
         let writer = unsafe { get_writer() };
-        write!(writer, $($arg)*);
+        write!(writer, $($arg)*).unwrap();
     }};
 }
 
@@ -102,7 +101,11 @@ fn main() -> ! {
         &clocks,
     );
 
-    println!("\n\n========================================\n");
+    println!();
+    println!();
+    println!("========================================");
+    println!();
+
     println!("Starting initialization.");
 
     delay.delay_ms(100u32);
@@ -116,6 +119,26 @@ fn main() -> ! {
     println!("Initialized.");
     let id = flash.read_jedec_id().unwrap();
     println!("Id {id:?}");
+
+    {
+        let status = flash.status_register().unwrap();
+        println!("before {:0b}", status.reg.get());
+    }
+
+    flash.disable_write().unwrap();
+    {
+        let status = flash.status_register().unwrap();
+        println!("after {:0b}", status.reg.get());
+        status.reg.WriteEnableLatch().set(true)
+    }
+
+    {
+        let status = flash.status_register().unwrap();
+        println!("after after {:0b}", status.reg.get());
+    }
+
+    //println!("config {:0b}", flash.read_regester(Addresses::CONFIGURATION_REGISTER).unwrap());
+    //println!("protec {:0b}", flash.read_regester(Addresses::PROTECTION_REGISTER).unwrap());
 
     loop {
         /*let sample = ms6511
@@ -131,5 +154,17 @@ fn main() -> ! {
         )
         .unwrap();
         */
+    }
+}
+
+use core::panic::PanicInfo;
+use core::sync::atomic::{self, Ordering};
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    println!("{}", info);
+    loop {
+        atomic::compiler_fence(Ordering::SeqCst);
     }
 }

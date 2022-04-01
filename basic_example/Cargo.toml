@@ -8,7 +8,6 @@ embedded-hal = "0.2"
 nb = "1"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-panic-halt = "0.2"
 w25n512gv = { path = "../" }
 
 [dependencies.stm32f4xx-hal]

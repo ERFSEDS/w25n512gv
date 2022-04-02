@@ -4,16 +4,16 @@
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::mem::MaybeUninit;
+use core::time::Duration;
 
-use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 use hal::pac::USART2;
+use hal::timer::{Event, Timer};
+use ms5611_spi::{Ms5611, Oversampling};
 
 use crate::hal::{pac, prelude::*, spi};
 use cortex_m_rt::entry;
 use stm32f4xx_hal as hal;
-
-use w25n512gv::{regs, Addresses, W25n512gv};
 
 static WRITER: Writer = Writer(UnsafeCell::new(MaybeUninit::uninit()));
 
@@ -50,9 +50,62 @@ macro_rules! print {
     }};
 }
 
+const BYTES: usize = 31_000;
+struct Data(UnsafeCell<heapless::Vec<u8, BYTES>>);
+
+static DATA: Data = Data(UnsafeCell::new(heapless::Vec::new()));
+
+unsafe impl Sync for Data {}
+unsafe impl Send for Data {}
+
+enum SampleKind {
+    Gyro,
+    Pressure,
+    Accel,
+}
+
+static LAST_TICKS: AtomicU32 = AtomicU32::new(0);
+static TICKS: AtomicU32 = AtomicU32::new(0);
+
+fn push_impl(val: u8) -> Result<(), ()> {
+    let data: &mut heapless::Vec<u8, BYTES> = unsafe { &mut *DATA.0.get() };
+    data.push(val).map_err(|_| ())
+}
+
+fn data_usage() -> usize {
+    let data: &mut heapless::Vec<u8, BYTES> = unsafe { &mut *DATA.0.get() };
+    data.len()
+}
+
+use hal::pac::interrupt;
+
+#[interrupt]
+fn TIM2() {
+    println!("T");
+    stm32f4xx_hal::pac::NVIC::unpend(hal::pac::Interrupt::TIM2);
+    TICKS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Returns true if full
+fn add_sample(kind: SampleKind, data: &[u8]) -> Result<(), ()> {
+    let kind_bits = match kind {
+        SampleKind::Gyro => 0xFF,
+        SampleKind::Pressure => 0xEE,
+        SampleKind::Accel => 0xDD,
+    };
+    push_impl(kind_bits)?;
+    for &byte in data {
+        push_impl(byte)?;
+    }
+
+    Ok(())
+}
+
 #[entry]
 fn main() -> ! {
     let dp = pac::Peripherals::take().unwrap();
+    let core = cortex_m::Peripherals::take().unwrap();
+
     let gpioa = dp.GPIOA.split();
     let gpiob = dp.GPIOB.split();
     let gpioc = dp.GPIOC.split();
@@ -84,24 +137,6 @@ fn main() -> ! {
     // HIGH_G/ACCEL PB2
     //
 
-    let sck = gpioc.pc10.into_alternate();
-    let miso = gpioc.pc11.into_alternate();
-    let mosi = gpioc.pc12.into_alternate();
-    let flash_cs = gpiob.pb13.into_push_pull_output();
-
-    let pins = (sck, miso, mosi);
-
-    let spi = spi::Spi::new(
-        dp.SPI3,
-        pins,
-        Mode {
-            polarity: Polarity::IdleLow,
-            phase: Phase::CaptureOnFirstTransition,
-        },
-        1000.kHz(),
-        &clocks,
-    );
-
     println!();
     println!();
     println!("========================================");
@@ -111,160 +146,127 @@ fn main() -> ! {
 
     delay.delay_ms(100u32);
 
-    let mut flash = W25n512gv::new(spi, flash_cs /*, &mut delay*/)
-        .map_err(|e| {
-            println!("Flash chip failed to intialize. {e:?}");
+    let sck = gpioa.pa5.into_alternate();
+    let miso = gpioa.pa6.into_alternate();
+    let mosi = gpioa.pa7.into_alternate();
+    let baro_cs = gpioc.pc5.into_push_pull_output();
+    let gyro_accel_cs = gpiob.pb0.into_push_pull_output();
+    let gyro_cs = gpiob.pb1.into_push_pull_output();
+
+    let pins = (sck, miso, mosi);
+
+    let spi = spi::Spi::new(
+        dp.SPI1,
+        pins,
+        Mode {
+            polarity: Polarity::IdleLow,
+            phase: Phase::CaptureOnFirstTransition,
+        },
+        1000.kHz(),
+        &clocks,
+    );
+
+    println!("Starting initialization.");
+
+    let spi_bus = shared_bus::BusManagerSimple::new(spi);
+
+    let mut ms6511 = Ms5611::new(spi_bus.acquire_spi(), baro_cs, &mut delay)
+        .map_err(|_| {
+            println!("Barometer failed to initialize.");
         })
         .unwrap();
 
-    flash.reset(&mut delay).unwrap();
+    println!("Barometer initialized.");
 
-    let mut config = flash
-        .read_regester(Addresses::CONFIGURATION_REGISTER)
-        .unwrap();
-    config |= 1 << 4; // Enable ECC
-    config |= 1; // disable HOLD
-    flash
-        .write_register(Addresses::CONFIGURATION_REGISTER, config)
-        .unwrap();
+    let mut bmi088_accel = bmi088::Builder::new_accel_spi(spi_bus.acquire_spi(), gyro_accel_cs);
 
-    fn status<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
-    where
-        SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
-            + embedded_hal::blocking::spi::Write<u8, Error = SE>,
-        CS: OutputPin<Error = PE>,
-    {
-        let val = chip
-            .read_regester(Addresses::STATUS_REGISTER)
-            .unwrap_or_else(|_| panic!());
-        let strs = [
-            "BUSY",
-            "Write enable",
-            "Erase Failure",
-            "Program failure",
-            "ECC 0",
-            "ECC 1",
-            "Look up table full",
-        ];
-        println!("Status:");
-        for (i, s) in strs.iter().enumerate() {
-            let bit = (val >> i) & 0b1;
-            if bit != 0 {
-                println!("{}: {}", s, bit);
-            }
-        }
-        println!();
+    if let Err(_) = bmi088_accel.setup(&mut delay) {
+        println!("Low-G accelerometer failed to initialize.");
+        panic!();
     }
 
-    fn protection<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
-    where
-        SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
-            + embedded_hal::blocking::spi::Write<u8, Error = SE>,
-        CS: OutputPin<Error = PE>,
-    {
-        let val = chip
-            .read_regester(Addresses::STATUS_REGISTER)
-            .unwrap_or_else(|_| panic!());
-        let strs = ["SRP1", "WP-E", "TB", "BP0", "BP1", "BP2", "BP3", "SRP0"];
-        println!("protection:");
-        for (i, s) in strs.iter().enumerate() {
-            let bit = (val >> i) & 0b1;
-            if bit != 0 {
-                println!("{}: {}", s, bit);
-            }
-        }
-        println!();
+    println!("Low-G accelerometer initialized.");
+
+    let mut bmi088_gyro = bmi088::Builder::new_gyro_spi(spi_bus.acquire_spi(), gyro_cs);
+
+    if let Err(_) = bmi088_gyro.setup(&mut delay) {
+        println!("Gyro failed to initialize.");
+        panic!();
     }
+
+    println!("Gyro initialized.");
+
+    /*
+    let mut h3lis331dl = h3lis331dl::H3LIS331DL::new(spi_bus.acquire_spi(), high_g_accel_cs)
+        .map_err(|e| {
+            println!("Accelerometer failed to initialize: {:?}.", e).unwrap();
+        })
+        .unwrap();
+    println!("Accelerometer initialized.").unwrap();
+    */
+
     println!("Initialized.");
-    protection(&mut flash);
-    let id = flash.read_jedec_id().unwrap();
-    println!("Id {id:?}");
 
-    status(&mut flash);
-
-    println!("Erasing chip...");
-    flash.enable_write().unwrap();
-    flash.chip_erase().unwrap();
-    println!("Done!");
-
-    fn dump_flash<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
-    where
-        SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
-            + embedded_hal::blocking::spi::Write<u8, Error = SE>,
-        CS: OutputPin<Error = PE>,
-    {
-        let mut buf = [0u8; w25n512gv::RAW_PAGE_SIZE];
-        chip.page_read_continous(&mut buf)
-            .unwrap_or_else(|_| panic!());
-
-        for i in 0..16 {
-            print!("{}, ", buf[i]);
-        }
-        println!();
-    }
-
-    println!();
-    println!("before");
-    let test_page = 2u16.pow(6);
-    flash.page_data_read(test_page).unwrap();
-    dump_flash(&mut flash);
-    status(&mut flash);
-
-    let mut index: u8 = 0;
-    let test_data = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC].map(|_| {
-        index = index.wrapping_add(1);
-        index
-    });
-    delay.delay_us(10u8);
-
-    flash.enable_write().unwrap();
-    flash.load_program_data(0, &test_data).unwrap();
-    for i in 0..128 {
-        println!("in buffer");
-        status(&mut flash);
-        dump_flash(&mut flash);
-        delay.delay_us(10u8);
-        flash.enable_write().unwrap();
-        flash.program_execute(i).unwrap();
-    }
-
-    println!("after");
-    status(&mut flash);
-    flash.page_data_read(test_page).unwrap();
-    dump_flash(&mut flash);
-
-    status(&mut flash);
-    println!(
-        "config {:0b}",
-        flash
-            .read_regester(Addresses::CONFIGURATION_REGISTER)
-            .unwrap()
-    );
-    println!(
-        "protec {:0b}",
-        flash.read_regester(Addresses::PROTECTION_REGISTER).unwrap()
-    );
-
-    println!("OK");
+    println!("Entering wait loop");
+    let mut largest = 0;
     loop {
-        /*let sample = ms6511
-            .get_second_order_sample(Oversampling::OS_256, &mut delay)
-            .unwrap();
+        if let Ok(sample) = bmi088_accel.get_accel() {
+            let total =
+                (sample[0] as i32).abs() + (sample[1] as i32).abs() + (sample[2] as i32).abs();
+            if total > largest {
+                largest = total;
+            }
+            println!("{total} - {largest}");
+            //if total > 150_000 {
+            if total > 40_000 {
+                break;
+            }
+        }
+    }
 
-        h3lis331dl.readAxes(&mut x, &mut y, &mut z).unwrap();
+    let mut run_loop = || -> Result<(), ()> {
+        loop {
+            {
+                let sample = ms6511
+                    .get_second_order_sample(Oversampling::OS_256, &mut delay)
+                    .unwrap();
 
-        writeln!(
-            serial,
-            "Temp: {}, Pressure: {}\nX: {}, Y: {}, Z: {}",
-            sample.temperature, sample.pressure, x, y, z
-        )
-        .unwrap();
-        */
+                let data: [u8; 8] = unsafe { core::mem::transmute(sample) };
+                add_sample(SampleKind::Pressure, &data)?;
+            }
+
+            if let Ok(sample) = bmi088_accel.get_accel() {
+                let data: [u8; 6] = unsafe { core::mem::transmute(sample) };
+                add_sample(SampleKind::Accel, &data)?;
+            }
+
+            if let Ok(sample) = bmi088_gyro.get_gyro() {
+                let data: [u8; 6] = unsafe { core::mem::transmute(sample) };
+                add_sample(SampleKind::Gyro, &data)?;
+            }
+            println!("{}", data_usage());
+            delay.delay_ms(25u32);
+        }
+    };
+
+    let _ = run_loop();
+
+    println!("Done");
+
+    loop {
+        println!("DATA DUMP:");
+        // wait for interrupt and then print data
+        let data = unsafe { &*DATA.0.get() };
+        println!("bytes {}", data.len());
+        for val in data.iter() {
+            print!("{val:0x}");
+        }
+        println!("END DATA DUMP");
     }
 }
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{self, Ordering};
+use core::sync::atomic::{self, AtomicU32, Ordering};
 
 #[inline(never)]
 #[panic_handler]

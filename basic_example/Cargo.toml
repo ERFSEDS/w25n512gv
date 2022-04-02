@@ -3,12 +3,26 @@ name = "basic"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+
 [dependencies]
 embedded-hal = "0.2"
 nb = "1"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 w25n512gv = { path = "../" }
+
+shared-bus = "0.2.3"
+bmi088 = "0.1.0"
+
+[dependencies.ms5611-spi]
+version = "0.2.0"
+default-features = false
+features = ["ms5607"]
 
 [dependencies.stm32f4xx-hal]
 version = "0.12.0"

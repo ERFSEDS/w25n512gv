@@ -81,7 +81,6 @@ use hal::pac::interrupt;
 
 #[interrupt]
 fn TIM2() {
-    println!("T");
     stm32f4xx_hal::pac::NVIC::unpend(hal::pac::Interrupt::TIM2);
     TICKS.fetch_add(1, Ordering::AcqRel);
 }
@@ -217,8 +216,8 @@ fn main() -> ! {
                 largest = total;
             }
             println!("{total} - {largest}");
-            //if total > 150_000 {
-            if total > 40_000 {
+            if total > 150_000 {
+                //if total > 40_000 {
                 break;
             }
         }
@@ -244,7 +243,7 @@ fn main() -> ! {
                 let data: [u8; 6] = unsafe { core::mem::transmute(sample) };
                 add_sample(SampleKind::Gyro, &data)?;
             }
-            println!("{}", data_usage());
+            //println!("{}", data_usage());
             delay.delay_ms(25u32);
         }
     };

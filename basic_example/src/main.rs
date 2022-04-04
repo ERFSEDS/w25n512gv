@@ -119,16 +119,41 @@ fn main() -> ! {
 
     flash.reset(&mut delay).unwrap();
 
-    let mut config = flash
+    let mut config_val = flash
         .read_regester(Addresses::CONFIGURATION_REGISTER)
         .unwrap();
-    config |= 1 << 4; // Enable ECC
-    config |= 1; // disable HOLD
+    config_val |= 1 << 4; // Enable ECC
+    config_val |= 1; // disable HOLD
     flash
-        .write_register(Addresses::CONFIGURATION_REGISTER, config)
+        .write_register(Addresses::CONFIGURATION_REGISTER, config_val)
         .unwrap();
 
-    fn status<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
+    // Disable all protections
+    flash
+        .write_register(Addresses::PROTECTION_REGISTER, 0)
+        .unwrap();
+
+    fn protection<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>, verbose: bool)
+    where
+        SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
+            + embedded_hal::blocking::spi::Write<u8, Error = SE>,
+        CS: OutputPin<Error = PE>,
+    {
+        let val = chip
+            .read_regester(Addresses::STATUS_REGISTER)
+            .unwrap_or_else(|_| panic!());
+        let strs = ["SRP1", "WP-E", "TB", "BP0", "BP1", "BP2", "BP3", "SRP0"];
+        println!("Protection:");
+        for (i, s) in strs.iter().enumerate() {
+            let bit = (val >> i) & 0b1;
+            if bit != 0 || verbose {
+                println!("  {}: {}", s, bit);
+            }
+        }
+        println!();
+    }
+
+    fn status<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>, verbose: bool)
     where
         SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
             + embedded_hal::blocking::spi::Write<u8, Error = SE>,
@@ -149,38 +174,41 @@ fn main() -> ! {
         println!("Status:");
         for (i, s) in strs.iter().enumerate() {
             let bit = (val >> i) & 0b1;
-            if bit != 0 {
-                println!("{}: {}", s, bit);
+            if bit != 0 || verbose {
+                println!("  {}: {}", s, bit);
             }
         }
         println!();
     }
 
-    fn protection<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
+    fn config<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>, verbose: bool)
     where
         SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
             + embedded_hal::blocking::spi::Write<u8, Error = SE>,
         CS: OutputPin<Error = PE>,
     {
         let val = chip
-            .read_regester(Addresses::STATUS_REGISTER)
+            .read_regester(Addresses::CONFIGURATION_REGISTER)
             .unwrap_or_else(|_| panic!());
-        let strs = ["SRP1", "WP-E", "TB", "BP0", "BP1", "BP2", "BP3", "SRP0"];
-        println!("protection:");
+        let strs = [
+            "H-DIS", "ODS-0", "ODS-1", "BUF", "ECC-E", "SR1-L", "OTP-E", "OTP-L",
+        ];
+        println!("configuration:");
         for (i, s) in strs.iter().enumerate() {
             let bit = (val >> i) & 0b1;
-            if bit != 0 {
-                println!("{}: {}", s, bit);
+            if bit != 0 || verbose {
+                println!("  {}: {}", s, bit);
             }
         }
         println!();
     }
     println!("Initialized.");
-    protection(&mut flash);
     let id = flash.read_jedec_id().unwrap();
     println!("Id {id:?}");
 
-    status(&mut flash);
+    protection(&mut flash, true);
+    status(&mut flash, true);
+    config(&mut flash, true);
 
     println!("Erasing chip...");
     flash.enable_write().unwrap();
@@ -204,11 +232,11 @@ fn main() -> ! {
     }
 
     println!();
-    println!("before");
+    println!("flashing page...");
     let test_page = 2u16.pow(6);
     flash.page_data_read(test_page).unwrap();
     dump_flash(&mut flash);
-    status(&mut flash);
+    status(&mut flash, true);
 
     let mut index: u8 = 0;
     let test_data = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC].map(|_| {
@@ -219,31 +247,26 @@ fn main() -> ! {
 
     flash.enable_write().unwrap();
     flash.load_program_data(0, &test_data).unwrap();
-    for i in 0..128 {
-        println!("in buffer");
-        status(&mut flash);
-        dump_flash(&mut flash);
+    println!("starting loop");
+    for i in 0..12 {
+        status(&mut flash, false);
+        config(&mut flash, false);
+        protection(&mut flash, false);
+
+        //dump_flash(&mut flash);
         delay.delay_us(10u8);
         flash.enable_write().unwrap();
         flash.program_execute(i).unwrap();
     }
 
-    println!("after");
-    status(&mut flash);
+    println!("after loop");
     flash.page_data_read(test_page).unwrap();
+    println!("data written:");
     dump_flash(&mut flash);
 
-    status(&mut flash);
-    println!(
-        "config {:0b}",
-        flash
-            .read_regester(Addresses::CONFIGURATION_REGISTER)
-            .unwrap()
-    );
-    println!(
-        "protec {:0b}",
-        flash.read_regester(Addresses::PROTECTION_REGISTER).unwrap()
-    );
+    protection(&mut flash, true);
+    status(&mut flash, true);
+    config(&mut flash, true);
 
     println!("OK");
     loop {

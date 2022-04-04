@@ -1,11 +1,16 @@
-#![deny(unsafe_code)]
 #![no_std]
 
 extern crate embedded_hal as hal;
+
 pub use hal::spi::{MODE_0, MODE_3};
 
+use embedded_hal::blocking::delay::DelayUs;
 use embedded_hal::blocking::spi::{Transfer, Write};
 use embedded_hal::digital::v2::OutputPin;
+
+pub const RAW_PAGE_SIZE: usize = 2112;
+pub const PAGE_SIZE_WITHOUT_ECC: usize = RAW_PAGE_SIZE;
+pub const PAGE_SIZE_WITH_ECC: usize = 2048;
 
 /// All possible errors in this crate
 #[derive(Debug)]
@@ -17,6 +22,8 @@ pub enum Error<SpiError, PinError> {
 
     /// Wrong Jedec id detected
     WrongJedecId(JedecId),
+
+    LengthTooLarge(usize),
 }
 
 impl<SpiError, PinError> From<SpiError> for Error<SpiError, PinError> {
@@ -38,7 +45,7 @@ where
 
 pub mod regs {
     rumio::define_mmio_register! {
-        ProtectionRegister: u16 {
+        ProtectionRegister: u8 {
             rw StatusRegisterProtect0: 7,
             rw BlockProtect3:          6,
             rw BlockProtect2:          5,
@@ -51,7 +58,7 @@ pub mod regs {
     }
 
     rumio::define_mmio_register! {
-        ConfigurationRegister: u16 {
+        ConfigurationRegister: u8 {
             rw OtpDataPagesLock:    7,
             rw EnterOtpMode:        6,
             rw StatusRegister1Lock: 5,
@@ -68,7 +75,7 @@ pub mod regs {
     }
 
     rumio::define_mmio_register! {
-        StatusRegister: u16 {
+        StatusRegister: u8 {
             rw BbmLutFull:          6,
             rw EccStatusBit: 4..5 = enum EccStatus [
                 /// Entire data output is successful, without any ECC correction.
@@ -115,15 +122,15 @@ where
         let mut dev = Self {
             bus: SpiInterface { spi, cs },
         };
-        /*let jedec = dev.read_jedec_id()?;
-        if jedec.manufacturer_id != 0xEF {
-            Err(Error::WrongJedecId(jedec))
-        } else if jedec.device_id != [0xAA, 0x20] {
-            Err(Error::WrongJedecId(jedec))
-        } else {
+        let jedec = dev.read_jedec_id()?;
+
+        if jedec == JedecId::new(0xEF, 0xAA, 0x20) {
             Ok(dev)
-        }*/
-        Ok(dev)
+        } else if jedec == JedecId::new(0xEF, 0xAA, 0x21) {
+            Ok(dev)
+        } else {
+            Err(Error::WrongJedecId(jedec))
+        }
     }
 
     pub fn read_jedec_id(&mut self) -> Result<JedecId, Error<SE, PE>> {
@@ -164,7 +171,121 @@ where
     /// This is the first step in writing data to the persistent memory in the flash chip
     /// The next step is issuing a program execute intsrution which will transfer the data in the
     /// memory buffer to a specific page on the flash memory
-    pub fn load_program_data(&mut self, buf: &[u8]) -> Result<(), Error<SE, PE>> {
+    ///
+    /// NOTE: Requires write enable to be active before the device will accept the data
+    pub fn load_program_data(&mut self, col_addr: u16, buf: &[u8]) -> Result<(), Error<SE, PE>> {
+        if buf.len() > RAW_PAGE_SIZE {
+            return Err(Error::LengthTooLarge(buf.len()));
+        }
+        let col_addr = col_addr.to_be_bytes();
+        self.bus.write_unbounded::<2, 0>(
+            Commands::PROGRAM_DATA_LOAD_RESET_BUFFER,
+            col_addr,
+            buf,
+        )?;
+        Ok(())
+    }
+
+    /// The Program Execute instruction is the second step of the Program operation. After the program data are
+    /// loaded into the 2,112-Byte Data Buffer (or 2,048 bytes when ECC is enabled), the Program Execute
+    /// instruction will program the Data Buffer content into the physical memory page that is specified in the
+    /// instruction. The instruction is initiated by driving the /CS pin low then shifting the instruction code “10h”
+    /// followed by 8-bit dummy clocks and the 16-bit Page Address into the DI pin as shown in Figure 17.
+    ///
+    /// After /CS is driven high to complete the instruction cycle, the self-timed Program Execute instruction will
+    /// commence for a time duration of tpp (See AC Characteristics). While the Program Execute cycle is in
+    /// progress, the Read Status Register instruction may still be used for checking the status of the BUSY bit.
+    /// The BUSY bit is a 1 during the Program Execute cycle and becomes a 0 when the cycle is finished and the
+    /// device is ready to accept other instructions again. After the Program Execute cycle has finished, the Write
+    /// Enable Latch (WEL) bit in the Status Register is cleared to 0. The Program Execute instruction will not be
+    /// executed if the addressed page is protected by the Block Protect (TB, BP2, BP1, and BP0) bits. Only 4
+    /// partial page program times are allowed on every single page.
+    ///
+    /// The pages within the block have to be programmed sequentially from the lower order page address to the
+    /// higher order page address within the block. Programming pages out of sequence is prohibited.
+    pub fn program_execute(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
+        let page_address = page_address.to_be_bytes();
+        let buf = [
+            Commands::PROGRAM_EXECUTE,
+            0,
+            page_address[0],
+            page_address[1],
+        ];
+        self.bus.write(buf)?;
+        Ok(())
+    }
+
+    /// The Page Data Read instruction will transfer the data of the specified memory page into the 2,112-Byte
+    /// Data Buffer. The instruction is initiated by driving the /CS pin low then shifting the instruction code “13h”
+    /// followed by 8-bit dummy clocks and the 16-bit Page Address into the DI pin as shown in Figure 18.
+    ///
+    /// After /CS is driven high to complete the instruction cycle, the self-timed Read Page Data instruction will
+    /// commence for a time duration of tRD (See AC Characteristics). While the Read Page Data cycle is in
+    /// progress, the Read Status Register instruction may still be used for checking the status of the BUSY bit.
+    /// The BUSY bit is a 1 during the Read Page Data cycle and becomes a 0 when the cycle is finished and the
+    /// device is ready to accept other instructions again.
+    ///
+    /// After the 2,112 bytes of page data are loaded into the Data Buffer, several Read instructions can be issued
+    /// to access the Data Buffer and read out the data. Depending on the BUF bit setting in the Status Register,
+    /// either “Buffer Read Mode” or “Continuous Read Mode” may be used to accomplish the read operations.
+    pub fn page_data_read(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
+        let page_address = page_address.to_be_bytes();
+        let buf = [
+            Commands::PAGE_DATA_READ,
+            0,
+            page_address[0],
+            page_address[1],
+        ];
+        self.bus.write(buf)?;
+
+        self.block_until_not_busy()
+    }
+
+    pub(crate) fn block_until_not_busy(&mut self) -> Result<(), Error<SE, PE>> {
+        loop {
+            let status = self.read_regester(Addresses::STATUS_REGISTER)?;
+            if status & 0b0000_0001 == 0 {
+                break Ok(());
+            }
+        }
+    }
+
+    /// The Read Data instruction allows one or more data bytes to be sequentially read from the Data Buffer after
+    /// executing the Read Page Data instruction. The Read Data instruction is initiated by driving the /CS pin low
+    /// and then shifting the instruction code “03h” followed by the 16-bit Column Address and 8-bit dummy clocks
+    /// or a 24-bit dummy clocks into the DI pin. After the address is received, the data byte of the addressed Data
+    /// Buffer location will be shifted out on the DO pin at the falling edge of CLK with most significant bit (MSB)
+    /// first. The address is automatically incremented to the next higher address after each byte of data is shifted
+    /// out allowing for a continuous stream of data. The instruction is completed by driving /CS high.
+    ///
+    /// The Read Data instruction sequence is shown in Figure 19a & 19b. When BUF=1, the device is in the Buffer
+    /// Read Mode. The data output sequence will start from the Data Buffer location specified by the 16-bit Column
+    /// Address and continue to the end of the Data Buffer. Once the last byte of data is output, the output pin will
+    /// become Hi-Z state. When BUF=0, the device is in the Continuous Read Mode, the data output sequence
+    /// will start from the first byte of the Data Buffer and increment to the next higher address. When the end of
+    /// the Data Buffer is reached, the data of the first byte of next memory page will be following and continues
+    /// through the entire memory array. This allows using a single Read instruction to read out the entire memory
+    /// array and is also compatible to Winbond’s SpiFlash NOR flash memory command sequence.
+    // We only implement continous reads because that is the default for this chip and we dont read
+    // much anyway. TODO: Implement a nice wrapper that allows the user to
+    pub fn page_read_continous(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
+        let page_address = 0u16.to_be_bytes();
+        self.bus
+            .read_unbounded::<2, 1>(Commands::READ, [page_address[0], page_address[1]], buf)?;
+        Ok(())
+    }
+
+    pub fn chip_erase(&mut self) -> Result<(), Error<SE, PE>> {
+        let buf = [Commands::CHIP_ERASE];
+        self.bus.write(buf)?;
+        self.block_until_not_busy()
+    }
+
+    pub fn reset(&mut self, delay: &mut impl DelayUs<u16>) -> Result<(), Error<SE, PE>> {
+        let buf = [Commands::DEVICE_RESET];
+        self.bus.write(buf)?;
+        delay.delay_us(500);
+
         Ok(())
     }
 }
@@ -283,12 +404,12 @@ where
     }
 }
 
-pub(crate) struct Addresses;
+pub struct Addresses;
 #[allow(dead_code)]
 impl Addresses {
-    const PROTECTION_REGISTER: u8 = 0xA0;
-    const CONFIGURATION_REGISTER: u8 = 0xB0;
-    const STATUS_REGISTER: u8 = 0xC0;
+    pub const PROTECTION_REGISTER: u8 = 0xA0;
+    pub const CONFIGURATION_REGISTER: u8 = 0xB0;
+    pub const STATUS_REGISTER: u8 = 0xC0;
 }
 
 pub(crate) struct Commands;
@@ -389,4 +510,13 @@ impl Commands {
 pub struct JedecId {
     pub manufacturer_id: u8,
     pub device_id: [u8; 2],
+}
+
+impl JedecId {
+    pub fn new(manufacturer_id: u8, dev1: u8, dev0: u8) -> Self {
+        Self {
+            manufacturer_id,
+            device_id: [dev1, dev0],
+        }
+    }
 }

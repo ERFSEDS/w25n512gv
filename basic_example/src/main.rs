@@ -109,30 +109,6 @@ fn main() -> ! {
 
     println!("Starting initialization.");
 
-    delay.delay_ms(100u32);
-
-    let mut flash = W25n512gv::new(spi, flash_cs /*, &mut delay*/)
-        .map_err(|e| {
-            println!("Flash chip failed to intialize. {e:?}");
-        })
-        .unwrap();
-
-    flash.reset(&mut delay).unwrap();
-
-    let mut config_val = flash
-        .read_regester(Addresses::CONFIGURATION_REGISTER)
-        .unwrap();
-    config_val |= 1 << 4; // Enable ECC
-    config_val |= 1; // disable HOLD
-    flash
-        .write_register(Addresses::CONFIGURATION_REGISTER, config_val)
-        .unwrap();
-
-    // Disable all protections
-    flash
-        .write_register(Addresses::PROTECTION_REGISTER, 0)
-        .unwrap();
-
     fn protection<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>, verbose: bool)
     where
         SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
@@ -202,20 +178,8 @@ fn main() -> ! {
         }
         println!();
     }
-    println!("Initialized.");
-    let id = flash.read_jedec_id().unwrap();
-    println!("Id {id:?}");
 
-    protection(&mut flash, true);
-    status(&mut flash, true);
-    config(&mut flash, true);
-
-    println!("Erasing chip...");
-    flash.enable_write().unwrap();
-    flash.chip_erase().unwrap();
-    println!("Done!");
-
-    fn dump_flash<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
+    fn dump_buf<SPI, CS, SE, PE>(chip: &mut W25n512gv<SPI, CS>)
     where
         SPI: embedded_hal::blocking::spi::Transfer<u8, Error = SE>
             + embedded_hal::blocking::spi::Write<u8, Error = SE>,
@@ -231,12 +195,73 @@ fn main() -> ! {
         println!();
     }
 
-    println!();
-    println!("flashing page...");
-    let test_page = 2u16.pow(6);
-    flash.page_data_read(test_page).unwrap();
-    dump_flash(&mut flash);
+    delay.delay_ms(100u32);
+
+    let mut flash = w25n512gv::new(spi, flash_cs /*, &mut delay*/)
+        .map_err(|e| {
+            println!("Flash chip failed to intialize. {e:?}");
+        })
+        .unwrap();
+
+    flash.reset(&mut delay).unwrap();
+
+    let mut config_val = flash
+        .read_regester(Addresses::CONFIGURATION_REGISTER)
+        .unwrap();
+    config_val |= 1 << 4; // Enable ECC
+    config_val |= 1; // disable HOLD
+    flash
+        .write_register(Addresses::CONFIGURATION_REGISTER, config_val)
+        .unwrap();
+
+    // Disable all protections
+    flash
+        .write_register(Addresses::PROTECTION_REGISTER, 0)
+        .unwrap();
+
+    println!("Initialized.");
+    let id = flash.read_jedec_id().unwrap();
+    println!("Id {id:?}");
+
+    protection(&mut flash, true);
     status(&mut flash, true);
+    config(&mut flash, true);
+
+    println!("page 0 before erase");
+    flash.page_data_read(0).unwrap();
+    dump_buf(&mut flash);
+
+    println!("Erasing first block");
+    flash.enable_write().unwrap();
+    flash.block_erase(0).unwrap();
+    status(&mut flash, true);
+    status(&mut flash, true);
+    status(&mut flash, true);
+    status(&mut flash, true);
+    println!("Done!");
+
+    println!("page 0 after erase");
+    flash.page_data_read(0).unwrap();
+    dump_buf(&mut flash);
+
+    println!("writing first time");
+    let mut index: u8 = 0;
+    let test_data = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC].map(|_| {
+        index = index.wrapping_add(2);
+        index
+    });
+
+    flash.enable_write().unwrap();
+    flash.load_program_data(0, &test_data).unwrap();
+    flash.program_execute(0).unwrap();
+
+    flash.page_data_read(0).unwrap();
+    dump_buf(&mut flash);
+    status(&mut flash, true);
+
+    println!("old page 0 after write");
+    flash.page_data_read(0).unwrap();
+    dump_buf(&mut flash);
 
     let mut index: u8 = 0;
     let test_data = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC].map(|_| {
@@ -245,45 +270,17 @@ fn main() -> ! {
     });
     delay.delay_us(10u8);
 
+    println!("writing second time");
     flash.enable_write().unwrap();
     flash.load_program_data(0, &test_data).unwrap();
-    println!("starting loop");
-    for i in 0..12 {
-        status(&mut flash, false);
-        config(&mut flash, false);
-        protection(&mut flash, false);
-
-        //dump_flash(&mut flash);
-        delay.delay_us(10u8);
-        flash.enable_write().unwrap();
-        flash.program_execute(i).unwrap();
-    }
-
-    println!("after loop");
-    flash.page_data_read(test_page).unwrap();
-    println!("data written:");
-    dump_flash(&mut flash);
+    flash.program_execute(0).unwrap();
 
     protection(&mut flash, true);
     status(&mut flash, true);
     config(&mut flash, true);
 
     println!("OK");
-    loop {
-        /*let sample = ms6511
-            .get_second_order_sample(Oversampling::OS_256, &mut delay)
-            .unwrap();
-
-        h3lis331dl.readAxes(&mut x, &mut y, &mut z).unwrap();
-
-        writeln!(
-            serial,
-            "Temp: {}, Pressure: {}\nX: {}, Y: {}, Z: {}",
-            sample.temperature, sample.pressure, x, y, z
-        )
-        .unwrap();
-        */
-    }
+    loop {}
 }
 
 use core::panic::PanicInfo;

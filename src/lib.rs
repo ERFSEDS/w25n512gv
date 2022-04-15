@@ -155,19 +155,9 @@ where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    let mut inner = W25n512gvImpl {
-        bus: SpiInterface { spi, cs },
-    };
-    let config = inner.read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
-    let status = inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
-    let protection = inner.read_regester_impl(Addresses::PROTECTION_REGISTER)?;
-
-    Ok(W25n512gv {
-        inner,
-        configuration: LocalRegisterCopy::new(config),
-        status: LocalRegisterCopy::new(status),
-        protection: LocalRegisterCopy::new(protection),
-    })
+    let inner = W25n512gvImpl::new(spi, cs)?;
+    // also read id
+    W25n512gv::read_registers(inner)
 }
 
 pub struct W25n512gv<SPI, CS, const S: Writability, const M: BufMode>
@@ -188,6 +178,18 @@ where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
+    pub(crate) fn read_registers(mut inner: W25n512gvImpl<SPI, CS>) -> Result<Self, Error<SE, PE>> {
+        let config = inner.read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
+        let status = inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
+        let protection = inner.read_regester_impl(Addresses::PROTECTION_REGISTER)?;
+
+        Ok(W25n512gv {
+            inner,
+            configuration: LocalRegisterCopy::new(config),
+            status: LocalRegisterCopy::new(status),
+            protection: LocalRegisterCopy::new(protection),
+        })
+    }
     pub fn read_status_register(
         &mut self,
     ) -> Result<LocalRegisterCopy<u8, regs::Status::Register>, Error<SE, PE>> {
@@ -275,14 +277,12 @@ where
     /// This is the first step in reading data from the flash chip
     // TODO: Return future for more efficent waiting while we upload to the flash chip
     pub fn read_sync(
-        &mut self,
+        mut self,
         page_addr: u16,
-    ) -> Result<BufferRef<'_, SPI, CS, { Writability::Disabled }>, Error<SE, PE>> {
+    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
         self.inner.page_data_read_impl(page_addr)?;
         self.inner.block_until_not_busy_impl()?;
-        Ok(BufferRef {
-            inner: &mut self.inner,
-        })
+        Ok(BufferRef { inner: self.inner })
     }
 
     /// Resets the chip to its default state.
@@ -335,39 +335,51 @@ where
     /// This is the first step in programming the flash chip
     // TODO: Return future for more efficent waiting while we upload to the flash chip
     pub fn upload_to_buffer_sync(
-        &mut self,
+        mut self,
         data: &[u8],
-    ) -> Result<BufferRef<'_, SPI, CS, { Writability::Enabled }>, Error<SE, PE>> {
+    ) -> Result<BufferRef<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
         self.inner.load_program_data_impl(0, data)?;
-        Ok(BufferRef {
-            inner: &mut self.inner,
-        })
+        Ok(BufferRef { inner: self.inner })
     }
 }
 
-pub struct BufferRef<'a, SPI, CS, const W: Writability>
+pub struct BufferRef<SPI, CS, const W: Writability, const M: BufMode>
 where
     SPI: Transfer<u8> + Write<u8>,
     CS: OutputPin,
 {
-    inner: &'a mut W25n512gvImpl<SPI, CS>,
+    inner: W25n512gvImpl<SPI, CS>,
 }
 
-impl<'a, SPI, CS, SE, PE, const W: Writability> BufferRef<'a, SPI, CS, W>
+impl<SPI, CS, SE, PE, const M: BufMode> BufferRef<SPI, CS, { Writability::Enabled }, M>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
     /// Writes the content of the flash chip's buffer to a page within the flash storage of the
     /// flash chip, blocking until completed
-    pub fn commit_sync(mut self, page_addr: u16) -> Result<(), Error<SE, PE>> {
+    pub fn commit_sync(
+        mut self,
+        page_addr: u16,
+    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
         self.inner.program_execute_impl(page_addr)?;
-        self.inner.block_until_not_busy_impl()
+        self.inner.block_until_not_busy_impl()?;
+        Ok(BufferRef { inner: self.inner })
     }
+}
 
+impl<SPI, CS, SE, PE, const W: Writability, const M: BufMode> BufferRef<SPI, CS, W, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
     /// Reads the content of the flash chip's buffer into memory using SPI, blocking until complete
     pub fn download_from_buffer_sync(&mut self, data: &mut [u8]) -> Result<(), Error<SE, PE>> {
         self.inner.page_read_continous_impl(data)
+    }
+
+    pub fn finish(mut self) -> Result<W25n512gv<SPI, CS, W, M>, Error<SE, PE>> {
+        W25n512gv::read_registers(self.inner)
     }
 }
 

@@ -443,9 +443,7 @@ where
         };
         let jedec = dev.read_jedec_id_impl()?;
 
-        if jedec == JedecId::new(0xEF, 0xAA, 0x20) {
-            Ok(dev)
-        } else if jedec == JedecId::new(0xEF, 0xAA, 0x21) {
+        if jedec == JedecId::new(0xEF, 0xAA, 0x20) || jedec == JedecId::new(0xEF, 0xAA, 0x21) {
             Ok(dev)
         } else {
             Err(Error::WrongJedecId(jedec))

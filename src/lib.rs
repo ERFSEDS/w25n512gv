@@ -341,6 +341,35 @@ where
         self.inner.load_program_data_impl(0, data)?;
         Ok(BufferRef { inner: self.inner })
     }
+
+    /// Erases a single page on the flash chip at address `page_addr`
+    pub fn erase(
+        mut self,
+        page_addr: u16,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.block_erase_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl();
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status: self.status,
+            protection: self.protection,
+        })
+    }
+
+    /// Erases the entire contents of the flash chip
+    pub fn erase_all(
+        mut self,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.chip_erase_impl()?;
+        self.inner.block_until_not_busy_impl();
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status: self.status,
+            protection: self.protection,
+        })
+    }
 }
 
 pub struct BufferRef<SPI, CS, const W: Writability, const M: BufMode>
@@ -437,10 +466,11 @@ where
     CS: OutputPin<Error = PE>,
 {
     pub(crate) fn read_jedec_id_impl(&mut self) -> Result<JedecId, Error<SE, PE>> {
-        let jedec: [u8; 3] = self.bus.execute([Commands::JEDEC_ID])?;
+        // 4 elements because the first 8 bits are garbage
+        let jedec: [u8; 4] = self.bus.execute([Commands::JEDEC_ID])?;
         Ok(JedecId {
-            manufacturer_id: jedec[0],
-            device_id: [jedec[1], jedec[2]],
+            manufacturer_id: jedec[1],
+            device_id: [jedec[2], jedec[3]],
         })
     }
 
@@ -524,7 +554,7 @@ where
         let page_address = page_address.to_be_bytes();
         self.bus.write([
             Commands::PROGRAM_EXECUTE,
-            0,
+            0, // 8 dummy bits
             page_address[0],
             page_address[1],
         ])
@@ -548,7 +578,7 @@ where
         let page_address = page_address.to_be_bytes();
         self.bus.write([
             Commands::PAGE_DATA_READ,
-            0,
+            0, // 8 dummy bits
             page_address[0],
             page_address[1],
         ])
@@ -556,7 +586,13 @@ where
 
     /// Blocks the current thread until the flash chip's BUSY bit is no longer set
     pub(crate) fn block_until_not_busy_impl(&mut self) -> Result<(), Error<SE, PE>> {
-        loop {}
+        loop {
+            let reg = self.read_regester_impl(Addresses::STATUS_REGISTER)?;
+            let reg = LocalRegisterCopy::<u8, regs::Status::Register>::new(reg);
+            if !reg.is_set(regs::Status::BUSY) {
+                break Ok(());
+            }
+        }
     }
 
     /// The Read Data instruction allows one or more data bytes to be sequentially read from the Data Buffer after
@@ -579,8 +615,9 @@ where
     // much anyway. TODO: Implement a nice wrapper that allows the user to
     pub(crate) fn page_read_continous_impl(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
         let page_address = 0u16.to_be_bytes();
+        // 8 dummy bits
         self.bus
-            .read_unbounded([Commands::READ, page_address[0], page_address[1]], buf)
+            .read_unbounded([Commands::READ, page_address[0], page_address[1], 0], buf)
     }
 
     /// NEEDS BLOCK
@@ -620,22 +657,23 @@ where
         Ok(())
     }
 
-    /// Executs `instruction` on the flash chip with `params`, returning the requesed number of
-    /// result bytes.
+    /// Executs a request on the flash chip by sending `request`
+    ///
+    /// Returns the requesed number of result bytes.
     pub fn execute<const REQUEST_LEN: usize, const RESULTS_LEN: usize>(
         &mut self,
         request: [u8; REQUEST_LEN],
     ) -> Result<[u8; RESULTS_LEN], Error<SE, PE>> {
-        let mut buf = [0u8; 16];
+        let mut tmp = [0u8; 16];
         for (i, &byte) in request.iter().enumerate() {
-            buf[i] = byte;
+            tmp[i] = byte;
         }
-        let buf_len = REQUEST_LEN + REQUEST_LEN;
+        let buf = &mut tmp[..REQUEST_LEN + RESULTS_LEN];
         // `Self::transfer` manages CS for us
-        self.transfer(&mut buf[..buf_len])?;
+        self.transfer(buf)?;
 
         let mut dst = [0u8; RESULTS_LEN];
-        dst.copy_from_slice(&buf[(buf_len - RESULTS_LEN)..]);
+        dst.copy_from_slice(&buf[(buf.len() - RESULTS_LEN)..]);
         Ok(dst)
     }
 

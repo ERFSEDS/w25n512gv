@@ -242,6 +242,74 @@ where
         self.inner
             .write_register_impl(Addresses::CONFIGURATION_REGISTER, config.get())
     }
+
+    pub fn modify_status_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Status::Register>),
+    {
+        let mut val = self.read_status_register()?;
+        f(&mut val);
+        self.write_status_register(val)
+    }
+
+    pub fn modify_protection_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Protection::Register>),
+    {
+        let mut val = self.read_protection_register()?;
+        f(&mut val);
+        self.write_protection_register(val)
+    }
+
+    pub fn modify_configuration_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Configuration::Register>),
+    {
+        let mut val = self.read_configuration_register()?;
+        f(&mut val);
+        self.write_configuration_register(val)
+    }
+
+    /// Reads the specified memory page on the flag chip to the flash chip's internal buffer.
+    ///
+    /// This is the first step in reading data from the flash chip
+    // TODO: Return future for more efficent waiting while we upload to the flash chip
+    pub fn read_sync(
+        &mut self,
+        page_addr: u16,
+    ) -> Result<BufferRef<'_, SPI, CS, { Writability::Disabled }>, Error<SE, PE>> {
+        self.inner.page_data_read_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl()?;
+        Ok(BufferRef {
+            inner: &mut self.inner,
+        })
+    }
+
+    /// Resets the chip to its default state.
+    ///
+    /// Consumes the device, returning the bus.
+    pub fn reset(mut self, delay: &mut impl DelayUs<u16>) -> (SPI, CS) {
+        // Make this infailable so that we can still reset in the event of an error
+        let _ = self.inner.reset_impl();
+        let bus = self.into_inner();
+        delay.delay_us(500);
+        bus
+    }
+
+    /// Consumes the device, returning the bus.
+    pub fn into_inner(self) -> (SPI, CS) {
+        self.inner.bus.into_inner()
+    }
+
+    /// Returns the size of a page based on the current configuration.
+    /// Returns [`PAGE_SIZE_WITH_ECC`] when error correction is enabled and
+    /// [`PAGE_SIZE_WITHOUT_ECC`] when ECC is disabled
+    pub fn page_size(&self) -> usize {
+        match self.configuration.is_set(regs::Configuration::ECC_E) {
+            true => PAGE_SIZE_WITH_ECC,
+            false => PAGE_SIZE_WITHOUT_ECC,
+        }
+    }
 }
 
 impl<SPI, CS, SE, PE, const M: BufMode> W25n512gv<SPI, CS, { Writability::Enabled }, M>
@@ -252,16 +320,54 @@ where
     pub fn disable_write(
         mut self,
     ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
-        let mut status = self.read_status_register()?;
-        status.modify(regs::Status::WEL::CLEAR);
-        self.write_status_register(status)?;
-
+        self.inner.disable_write_impl()?;
+        let status = self.read_status_register()?;
         Ok(W25n512gv {
             inner: self.inner,
             configuration: self.configuration,
-            status: self.status,
+            status,
             protection: self.protection,
         })
+    }
+
+    /// Uploads `data` to the flash chip's internal buffer, blocking until completed.
+    ///
+    /// This is the first step in programming the flash chip
+    // TODO: Return future for more efficent waiting while we upload to the flash chip
+    pub fn upload_to_buffer_sync(
+        &mut self,
+        data: &[u8],
+    ) -> Result<BufferRef<'_, SPI, CS, { Writability::Enabled }>, Error<SE, PE>> {
+        self.inner.load_program_data_impl(0, data)?;
+        Ok(BufferRef {
+            inner: &mut self.inner,
+        })
+    }
+}
+
+pub struct BufferRef<'a, SPI, CS, const W: Writability>
+where
+    SPI: Transfer<u8> + Write<u8>,
+    CS: OutputPin,
+{
+    inner: &'a mut W25n512gvImpl<SPI, CS>,
+}
+
+impl<'a, SPI, CS, SE, PE, const W: Writability> BufferRef<'a, SPI, CS, W>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    /// Writes the content of the flash chip's buffer to a page within the flash storage of the
+    /// flash chip, blocking until completed
+    pub fn commit_sync(mut self, page_addr: u16) -> Result<(), Error<SE, PE>> {
+        self.inner.program_execute_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl()
+    }
+
+    /// Reads the content of the flash chip's buffer into memory using SPI, blocking until complete
+    pub fn download_from_buffer_sync(&mut self, data: &mut [u8]) -> Result<(), Error<SE, PE>> {
+        self.inner.page_read_continous_impl(data)
     }
 }
 
@@ -273,14 +379,12 @@ where
     pub fn enable_write(
         mut self,
     ) -> Result<W25n512gv<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
-        let mut status = self.read_status_register()?;
-        status.modify(regs::Status::WEL::SET);
-        self.write_status_register(status)?;
-
+        self.inner.enable_write_impl()?;
+        let status = self.read_status_register()?;
         Ok(W25n512gv {
             inner: self.inner,
             configuration: self.configuration,
-            status: self.status,
+            status,
             protection: self.protection,
         })
     }
@@ -440,9 +544,7 @@ where
 
     /// Blocks the current thread until the flash chip's BUSY bit is no longer set
     pub(crate) fn block_until_not_busy_impl(&mut self) -> Result<(), Error<SE, PE>> {
-        loop {
-            //TODO
-        }
+        loop {}
     }
 
     /// The Read Data instruction allows one or more data bytes to be sequentially read from the Data Buffer after
@@ -475,10 +577,7 @@ where
     }
 
     /// NEEDS BLOCK for 500 us
-    pub(crate) fn reset_impl(
-        &mut self,
-        delay: &mut impl DelayUs<u16>,
-    ) -> Result<(), Error<SE, PE>> {
+    pub(crate) fn reset_impl(&mut self) -> Result<(), Error<SE, PE>> {
         self.bus.write([Commands::DEVICE_RESET])
     }
 }
@@ -570,6 +669,10 @@ where
 
     pub(crate) fn cs_enable(&mut self) -> Result<(), Error<SE, PE>> {
         self.cs.set_low().map_err(|pe| Error::Pin(pe))
+    }
+
+    pub(crate) fn into_inner(self) -> (SPI, CS) {
+        (self.spi, self.cs)
     }
 }
 

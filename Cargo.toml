@@ -13,5 +13,5 @@ categories = ["embedded"]
 
 [dependencies]
 embedded-hal = "0.2.7"
-rumio = "0.2.0"
+tock-registers = "0.7.0"
 heapless = "0.7.10"

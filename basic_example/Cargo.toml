@@ -15,8 +15,6 @@ nb = "1"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 w25n512gv = { path = "../" }
-heapless = "0.7.10"
-fugit = "0.3.5"
 
 shared-bus = "0.2.3"
 bmi088 = "0.1.0"

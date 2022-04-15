@@ -1,4 +1,8 @@
 #![no_std]
+#![deny(unsafe_op_in_unsafe_fn)]
+// Used for parameterizing writable and mode status into wrapper types
+#![allow(incomplete_features, unused)]
+#![feature(adt_const_params)]
 
 extern crate embedded_hal as hal;
 
@@ -7,6 +11,7 @@ pub use hal::spi::{MODE_0, MODE_3};
 use embedded_hal::blocking::delay::DelayUs;
 use embedded_hal::blocking::spi::{Transfer, Write};
 use embedded_hal::digital::v2::OutputPin;
+use tock_registers::LocalRegisterCopy;
 
 pub const RAW_PAGE_SIZE: usize = 2112;
 pub const PAGE_SIZE_WITHOUT_ECC: usize = RAW_PAGE_SIZE;
@@ -44,40 +49,56 @@ where
 }
 
 pub mod regs {
-    rumio::define_mmio_register! {
-        ProtectionRegister: u8 {
-            rw StatusRegisterProtect0: 7,
-            rw BlockProtect3:          6,
-            rw BlockProtect2:          5,
-            rw BlockProtect1:          4,
-            rw BlockProtect0:          3,
-            rw TopBottomProtect:       2,
-            rw WPEnable:               1,
-            rw StatusRegisterProtect1: 0,
-        }
-    }
-
-    rumio::define_mmio_register! {
-        ConfigurationRegister: u8 {
-            rw OtpDataPagesLock:    7,
-            rw EnterOtpMode:        6,
-            rw StatusRegister1Lock: 5,
-            rw EnableECC:           4,
-            rw BufferMode:          3,
-            rw OutputDriverStrength: 1..2 = enum DriverStrength [
-                Strength100 = 0b00,
-                Strength75 =  0b01,
-                Strength50 =  0b10,
-                Strength25 =  0b11,
+    tock_registers::register_bitfields! [
+        u8,
+        pub Protection [
+            /// Status register protect lock-0
+            SRP0  OFFSET(7) NUMBITS(1) [],
+            /// Block protect bit 3
+            BP3  OFFSET(6) NUMBITS(1) [],
+            /// Block protect bit 2
+            BP2  OFFSET(5) NUMBITS(1) [],
+            /// Block protect bit 1
+            BP1  OFFSET(4) NUMBITS(1) [],
+            /// Block protect bit 0
+            BP0  OFFSET(3) NUMBITS(1) [],
+            /// Top/Bottom block protect bit
+            TB  OFFSET(2) NUMBITS(1) [],
+            /// WP-enable bit
+            WP_E  OFFSET(1) NUMBITS(1) [],
+            /// Status register protect lock-1
+            SRP1  OFFSET(0) NUMBITS(1) [],
+        ],
+        pub Configuration [
+            /// One time program lock
+            OTP_L  OFFSET(7) NUMBITS(1) [],
+            /// Enter OPT mode
+            OTP_E  OFFSET(6) NUMBITS(1) [],
+            /// Status register 1 lock
+            SR1_L  OFFSET(5) NUMBITS(1) [],
+            /// Enable ECC
+            ECC_E  OFFSET(4) NUMBITS(1) [],
+            /// Buffer mode
+            BUF  OFFSET(3) NUMBITS(1) [
+                BufferRead = 0,
+                ContinuousBufferRead = 1,
             ],
-            rw HoldDisable:         0,
-        }
-    }
 
-    rumio::define_mmio_register! {
-        StatusRegister: u8 {
-            rw BbmLutFull:          6,
-            rw EccStatusBit: 4..5 = enum EccStatus [
+            /// Output strength
+            ODS OFFSET(1) NUMBITS(2) [
+                P100 = 0b00,
+                P75 = 0b01,
+                P50 = 0b10,
+                P25 = 0b11,
+            ],
+            /// Hold disable
+            H_DIS  OFFSET(0) NUMBITS(1) [],
+        ],
+
+        pub Status [
+            /// Enter OPT mode
+            LUT_F  OFFSET(6) NUMBITS(1) [],
+            ECC  OFFSET(4) NUMBITS(2) [
                 /// Entire data output is successful, without any ECC correction.
                 Success =                   0b00,
                 /// Entire data output is successful, with 1~4 bit/page ECC corrections in either
@@ -96,16 +117,17 @@ pub mod regs {
                 /// Data is not suitable to use.
                 MultiPageFailure =          0b11,
             ],
-            rw ProgramFailure:      3,
-            rw EraseFailure:        2,
-            rw WriteEnableLatch:    1,
-            rw OperationInProgress: 0,
-        }
-    }
+
+            P_FAIL  OFFSET(3) NUMBITS(1) [],
+            E_FAIL  OFFSET(2) NUMBITS(1) [],
+            WEL  OFFSET(1) NUMBITS(1) [],
+            BUSY  OFFSET(0) NUMBITS(1) [],
+        ],
+    ];
 }
 
 /// Flash chip api
-pub struct W25n512gv<SPI, CS>
+pub(crate) struct W25n512gvImpl<SPI, CS>
 where
     SPI: Transfer<u8> + Write<u8>,
     CS: OutputPin,
@@ -113,7 +135,304 @@ where
     bus: SpiInterface<SPI, CS>,
 }
 
-impl<SPI, CS, SE, PE> W25n512gv<SPI, CS>
+#[derive(PartialEq, Eq)]
+pub enum Writability {
+    Enabled,
+    Disabled,
+}
+
+#[derive(PartialEq, Eq)]
+pub enum BufMode {
+    Normal,
+    Continuous,
+}
+
+pub fn new<SPI, CS, SE, PE>(
+    spi: SPI,
+    cs: CS,
+) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, { BufMode::Normal }>, Error<SE, PE>>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    let inner = W25n512gvImpl::new(spi, cs)?;
+    // also read id
+    W25n512gv::read_registers(inner)
+}
+
+pub struct W25n512gv<SPI, CS, const S: Writability, const M: BufMode>
+where
+    SPI: Transfer<u8> + Write<u8>,
+    CS: OutputPin,
+{
+    inner: W25n512gvImpl<SPI, CS>,
+
+    configuration: LocalRegisterCopy<u8, regs::Configuration::Register>,
+    status: LocalRegisterCopy<u8, regs::Status::Register>,
+    protection: LocalRegisterCopy<u8, regs::Protection::Register>,
+}
+
+/// Impl for any read mode and any writability
+impl<SPI, CS, SE, PE, const S: Writability, const M: BufMode> W25n512gv<SPI, CS, S, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    pub(crate) fn read_registers(mut inner: W25n512gvImpl<SPI, CS>) -> Result<Self, Error<SE, PE>> {
+        let config = inner.read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
+        let status = inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
+        let protection = inner.read_regester_impl(Addresses::PROTECTION_REGISTER)?;
+
+        Ok(W25n512gv {
+            inner,
+            configuration: LocalRegisterCopy::new(config),
+            status: LocalRegisterCopy::new(status),
+            protection: LocalRegisterCopy::new(protection),
+        })
+    }
+    pub fn read_status_register(
+        &mut self,
+    ) -> Result<LocalRegisterCopy<u8, regs::Status::Register>, Error<SE, PE>> {
+        let bits = self.inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
+        self.status = LocalRegisterCopy::new(bits);
+        Ok(self.status)
+    }
+
+    pub fn read_protection_register(
+        &mut self,
+    ) -> Result<LocalRegisterCopy<u8, regs::Protection::Register>, Error<SE, PE>> {
+        let bits = self
+            .inner
+            .read_regester_impl(Addresses::PROTECTION_REGISTER)?;
+        self.protection = LocalRegisterCopy::new(bits);
+        Ok(self.protection)
+    }
+
+    pub fn read_configuration_register(
+        &mut self,
+    ) -> Result<LocalRegisterCopy<u8, regs::Configuration::Register>, Error<SE, PE>> {
+        let bits = self
+            .inner
+            .read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
+        self.configuration = LocalRegisterCopy::new(bits);
+        Ok(self.configuration)
+    }
+
+    pub fn write_status_register(
+        &mut self,
+        status: LocalRegisterCopy<u8, regs::Status::Register>,
+    ) -> Result<(), Error<SE, PE>> {
+        self.status = status;
+        self.inner
+            .write_register_impl(Addresses::STATUS_REGISTER, status.get())
+    }
+
+    pub fn write_protection_register(
+        &mut self,
+        protec: LocalRegisterCopy<u8, regs::Protection::Register>,
+    ) -> Result<(), Error<SE, PE>> {
+        self.protection = protec;
+        self.inner
+            .write_register_impl(Addresses::PROTECTION_REGISTER, protec.get())
+    }
+
+    pub fn write_configuration_register(
+        &mut self,
+        config: LocalRegisterCopy<u8, regs::Configuration::Register>,
+    ) -> Result<(), Error<SE, PE>> {
+        self.configuration = config;
+        self.inner
+            .write_register_impl(Addresses::CONFIGURATION_REGISTER, config.get())
+    }
+
+    pub fn modify_status_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Status::Register>),
+    {
+        let mut val = self.read_status_register()?;
+        f(&mut val);
+        self.write_status_register(val)
+    }
+
+    pub fn modify_protection_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Protection::Register>),
+    {
+        let mut val = self.read_protection_register()?;
+        f(&mut val);
+        self.write_protection_register(val)
+    }
+
+    pub fn modify_configuration_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    where
+        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Configuration::Register>),
+    {
+        let mut val = self.read_configuration_register()?;
+        f(&mut val);
+        self.write_configuration_register(val)
+    }
+
+    /// Reads the specified memory page on the flag chip to the flash chip's internal buffer.
+    ///
+    /// This is the first step in reading data from the flash chip
+    // TODO: Return future for more efficent waiting while we upload to the flash chip
+    pub fn read_sync(
+        mut self,
+        page_addr: u16,
+    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.page_data_read_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl()?;
+        Ok(BufferRef { inner: self.inner })
+    }
+
+    /// Resets the chip to its default state.
+    ///
+    /// Consumes the device, returning the bus.
+    pub fn reset(mut self, delay: &mut impl DelayUs<u16>) -> (SPI, CS) {
+        // Make this infailable so that we can still reset in the event of an error
+        let _ = self.inner.reset_impl();
+        let bus = self.into_inner();
+        delay.delay_us(500);
+        bus
+    }
+
+    /// Consumes the device, returning the bus.
+    pub fn into_inner(self) -> (SPI, CS) {
+        self.inner.bus.into_inner()
+    }
+
+    /// Returns the size of a page based on the current configuration.
+    /// Returns [`PAGE_SIZE_WITH_ECC`] when error correction is enabled and
+    /// [`PAGE_SIZE_WITHOUT_ECC`] when ECC is disabled
+    pub fn page_size(&self) -> usize {
+        match self.configuration.is_set(regs::Configuration::ECC_E) {
+            true => PAGE_SIZE_WITH_ECC,
+            false => PAGE_SIZE_WITHOUT_ECC,
+        }
+    }
+}
+
+impl<SPI, CS, SE, PE, const M: BufMode> W25n512gv<SPI, CS, { Writability::Enabled }, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    pub fn disable_write(
+        mut self,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.disable_write_impl()?;
+        let status = self.read_status_register()?;
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status,
+            protection: self.protection,
+        })
+    }
+
+    /// Uploads `data` to the flash chip's internal buffer, blocking until completed.
+    ///
+    /// This is the first step in programming the flash chip
+    // TODO: Return future for more efficent waiting while we upload to the flash chip
+    pub fn upload_to_buffer_sync(
+        mut self,
+        data: &[u8],
+    ) -> Result<BufferRef<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
+        self.inner.load_program_data_impl(0, data)?;
+        Ok(BufferRef { inner: self.inner })
+    }
+
+    /// Erases a single page on the flash chip at address `page_addr`
+    pub fn erase(
+        mut self,
+        page_addr: u16,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.block_erase_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl();
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status: self.status,
+            protection: self.protection,
+        })
+    }
+
+    /// Erases the entire contents of the flash chip
+    pub fn erase_all(
+        mut self,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.chip_erase_impl()?;
+        self.inner.block_until_not_busy_impl();
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status: self.status,
+            protection: self.protection,
+        })
+    }
+}
+
+pub struct BufferRef<SPI, CS, const W: Writability, const M: BufMode>
+where
+    SPI: Transfer<u8> + Write<u8>,
+    CS: OutputPin,
+{
+    inner: W25n512gvImpl<SPI, CS>,
+}
+
+impl<SPI, CS, SE, PE, const M: BufMode> BufferRef<SPI, CS, { Writability::Enabled }, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    /// Writes the content of the flash chip's buffer to a page within the flash storage of the
+    /// flash chip, blocking until completed
+    pub fn commit_sync(
+        mut self,
+        page_addr: u16,
+    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+        self.inner.program_execute_impl(page_addr)?;
+        self.inner.block_until_not_busy_impl()?;
+        Ok(BufferRef { inner: self.inner })
+    }
+}
+
+impl<SPI, CS, SE, PE, const W: Writability, const M: BufMode> BufferRef<SPI, CS, W, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    /// Reads the content of the flash chip's buffer into memory using SPI, blocking until complete
+    pub fn download_from_buffer_sync(&mut self, data: &mut [u8]) -> Result<(), Error<SE, PE>> {
+        self.inner.page_read_continous_impl(data)
+    }
+
+    pub fn finish(mut self) -> Result<W25n512gv<SPI, CS, W, M>, Error<SE, PE>> {
+        W25n512gv::read_registers(self.inner)
+    }
+}
+
+impl<SPI, CS, SE, PE, const M: BufMode> W25n512gv<SPI, CS, { Writability::Disabled }, M>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    pub fn enable_write(
+        mut self,
+    ) -> Result<W25n512gv<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
+        self.inner.enable_write_impl()?;
+        let status = self.read_status_register()?;
+        Ok(W25n512gv {
+            inner: self.inner,
+            configuration: self.configuration,
+            status,
+            protection: self.protection,
+        })
+    }
+}
+
+/// High level implementations of the api
+impl<SPI, CS, SE, PE> W25n512gvImpl<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
@@ -122,50 +441,69 @@ where
         let mut dev = Self {
             bus: SpiInterface { spi, cs },
         };
-        let jedec = dev.read_jedec_id()?;
+        let jedec = dev.read_jedec_id_impl()?;
 
-        if jedec == JedecId::new(0xEF, 0xAA, 0x20) {
-            Ok(dev)
-        } else if jedec == JedecId::new(0xEF, 0xAA, 0x21) {
+        if jedec == JedecId::new(0xEF, 0xAA, 0x20) || jedec == JedecId::new(0xEF, 0xAA, 0x21) {
             Ok(dev)
         } else {
             Err(Error::WrongJedecId(jedec))
         }
     }
+}
 
-    pub fn read_jedec_id(&mut self) -> Result<JedecId, Error<SE, PE>> {
-        let jedec: [u8; 3] = self.bus.execute::<0, 1, 3>(Commands::JEDEC_ID, [])?;
+/// Low level implementation functions
+///
+/// Each _impl function wraps an instruction that can be executed by the flash chip. This API maps
+/// very closely to what is provided on the chip, so virtually no invariants are enforced at this
+/// level.
+///
+/// See the high level implementations which use rust types to make things safer
+impl<SPI, CS, SE, PE> W25n512gvImpl<SPI, CS>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    pub(crate) fn read_jedec_id_impl(&mut self) -> Result<JedecId, Error<SE, PE>> {
+        // 4 elements because the first 8 bits are garbage
+        let jedec: [u8; 4] = self.bus.execute([Commands::JEDEC_ID])?;
         Ok(JedecId {
-            manufacturer_id: jedec[0],
-            device_id: [jedec[1], jedec[2]],
+            manufacturer_id: jedec[1],
+            device_id: [jedec[2], jedec[3]],
         })
     }
 
-    pub fn read_regester(&mut self, register: u8) -> Result<u8, Error<SE, PE>> {
+    pub(crate) fn read_regester_impl(&mut self, register: u8) -> Result<u8, Error<SE, PE>> {
         let value: [u8; 1] = self
             .bus
-            .execute::<1, 0, 1>(Commands::READ_STATUS_REGISTER, [register])?;
+            .execute([Commands::READ_STATUS_REGISTER, register])?;
         Ok(value[0])
     }
 
-    pub fn write_register(&mut self, register: u8, value: u8) -> Result<(), Error<SE, PE>> {
-        let _: [u8; 0] = self
-            .bus
-            .execute::<2, 0, 0>(Commands::WRITE_STATUS_REGISTER, [register, value])?;
-        Ok(())
+    pub(crate) fn write_register_impl(
+        &mut self,
+        register: u8,
+        value: u8,
+    ) -> Result<(), Error<SE, PE>> {
+        self.bus
+            .write([Commands::WRITE_STATUS_REGISTER, register, value])
     }
 
-    pub fn disable_write(&mut self) -> Result<(), Error<SE, PE>> {
-        let _: [u8; 0] = self.bus.execute::<0, 0, 0>(Commands::WRITE_DISABLE, [])?;
-        Ok(())
+    pub(crate) fn disable_write_impl(&mut self) -> Result<(), Error<SE, PE>> {
+        self.bus.write([Commands::WRITE_DISABLE])
     }
 
-    pub fn enable_write(&mut self) -> Result<(), Error<SE, PE>> {
-        let _: [u8; 0] = self.bus.execute::<0, 0, 0>(Commands::WRITE_ENABLE, [])?;
-        Ok(())
+    pub(crate) fn enable_write_impl(&mut self) -> Result<(), Error<SE, PE>> {
+        self.bus.write([Commands::WRITE_ENABLE])
     }
 
-    // Skipped bad block managment through block erase not yet implemented
+    // Skipped bad block managment
+
+    /// NEEDS BLOCK
+    pub(crate) fn block_erase_impl(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
+        let page_address = page_address.to_be_bytes();
+        self.bus
+            .write([Commands::BLOCK_ERASE, 0, page_address[0], page_address[1]])
+    }
 
     /// Writes `buf` into the flash chip's internal memory buffer.
     /// This is the first step in writing data to the persistent memory in the flash chip
@@ -173,19 +511,26 @@ where
     /// memory buffer to a specific page on the flash memory
     ///
     /// NOTE: Requires write enable to be active before the device will accept the data
-    pub fn load_program_data(&mut self, col_addr: u16, buf: &[u8]) -> Result<(), Error<SE, PE>> {
+    pub(crate) fn load_program_data_impl(
+        &mut self,
+        col_addr: u16,
+        buf: &[u8],
+    ) -> Result<(), Error<SE, PE>> {
         if buf.len() > RAW_PAGE_SIZE {
             return Err(Error::LengthTooLarge(buf.len()));
         }
         let col_addr = col_addr.to_be_bytes();
-        self.bus.write_unbounded::<2, 0>(
-            Commands::PROGRAM_DATA_LOAD_RESET_BUFFER,
-            col_addr,
+        self.bus.write_unbounded(
+            [
+                Commands::PROGRAM_DATA_LOAD_RESET_BUFFER,
+                col_addr[0],
+                col_addr[1],
+            ],
             buf,
-        )?;
-        Ok(())
+        )
     }
 
+    /// NEEDS BLOCK
     /// The Program Execute instruction is the second step of the Program operation. After the program data are
     /// loaded into the 2,112-Byte Data Buffer (or 2,048 bytes when ECC is enabled), the Program Execute
     /// instruction will program the Data Buffer content into the physical memory page that is specified in the
@@ -203,18 +548,17 @@ where
     ///
     /// The pages within the block have to be programmed sequentially from the lower order page address to the
     /// higher order page address within the block. Programming pages out of sequence is prohibited.
-    pub fn program_execute(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
+    pub(crate) fn program_execute_impl(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
         let page_address = page_address.to_be_bytes();
-        let buf = [
+        self.bus.write([
             Commands::PROGRAM_EXECUTE,
-            0,
+            0, // 8 dummy bits
             page_address[0],
             page_address[1],
-        ];
-        self.bus.write(buf)?;
-        Ok(())
+        ])
     }
 
+    /// NEEDS BLOCK
     /// The Page Data Read instruction will transfer the data of the specified memory page into the 2,112-Byte
     /// Data Buffer. The instruction is initiated by driving the /CS pin low then shifting the instruction code “13h”
     /// followed by 8-bit dummy clocks and the 16-bit Page Address into the DI pin as shown in Figure 18.
@@ -228,23 +572,22 @@ where
     /// After the 2,112 bytes of page data are loaded into the Data Buffer, several Read instructions can be issued
     /// to access the Data Buffer and read out the data. Depending on the BUF bit setting in the Status Register,
     /// either “Buffer Read Mode” or “Continuous Read Mode” may be used to accomplish the read operations.
-    pub fn page_data_read(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
+    pub(crate) fn page_data_read_impl(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
         let page_address = page_address.to_be_bytes();
-        let buf = [
+        self.bus.write([
             Commands::PAGE_DATA_READ,
-            0,
+            0, // 8 dummy bits
             page_address[0],
             page_address[1],
-        ];
-        self.bus.write(buf)?;
-
-        self.block_until_not_busy()
+        ])
     }
 
-    pub(crate) fn block_until_not_busy(&mut self) -> Result<(), Error<SE, PE>> {
+    /// Blocks the current thread until the flash chip's BUSY bit is no longer set
+    pub(crate) fn block_until_not_busy_impl(&mut self) -> Result<(), Error<SE, PE>> {
         loop {
-            let status = self.read_regester(Addresses::STATUS_REGISTER)?;
-            if status & 0b0000_0001 == 0 {
+            let reg = self.read_regester_impl(Addresses::STATUS_REGISTER)?;
+            let reg = LocalRegisterCopy::<u8, regs::Status::Register>::new(reg);
+            if !reg.is_set(regs::Status::BUSY) {
                 break Ok(());
             }
         }
@@ -268,25 +611,21 @@ where
     /// array and is also compatible to Winbond’s SpiFlash NOR flash memory command sequence.
     // We only implement continous reads because that is the default for this chip and we dont read
     // much anyway. TODO: Implement a nice wrapper that allows the user to
-    pub fn page_read_continous(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
+    pub(crate) fn page_read_continous_impl(&mut self, buf: &mut [u8]) -> Result<(), Error<SE, PE>> {
         let page_address = 0u16.to_be_bytes();
+        // 8 dummy bits
         self.bus
-            .read_unbounded::<2, 1>(Commands::READ, [page_address[0], page_address[1]], buf)?;
-        Ok(())
+            .read_unbounded([Commands::READ, page_address[0], page_address[1], 0], buf)
     }
 
-    pub fn chip_erase(&mut self) -> Result<(), Error<SE, PE>> {
-        let buf = [Commands::CHIP_ERASE];
-        self.bus.write(buf)?;
-        self.block_until_not_busy()
+    /// NEEDS BLOCK
+    pub(crate) fn chip_erase_impl(&mut self) -> Result<(), Error<SE, PE>> {
+        self.bus.write([Commands::CHIP_ERASE])
     }
 
-    pub fn reset(&mut self, delay: &mut impl DelayUs<u16>) -> Result<(), Error<SE, PE>> {
-        let buf = [Commands::DEVICE_RESET];
-        self.bus.write(buf)?;
-        delay.delay_us(500);
-
-        Ok(())
+    /// NEEDS BLOCK for 500 us
+    pub(crate) fn reset_impl(&mut self) -> Result<(), Error<SE, PE>> {
+        self.bus.write([Commands::DEVICE_RESET])
     }
 }
 
@@ -316,35 +655,35 @@ where
         Ok(())
     }
 
-    /// Executs `instruction` on the flash chip with `params`, returning the requesed number of
-    /// result bytes.
-    pub fn execute<const PARAMS: usize, const DUMMY_BYTES: usize, const RESULTS: usize>(
+    /// Executs a request on the flash chip by sending `request`
+    ///
+    /// Returns the requesed number of result bytes.
+    pub fn execute<const REQUEST_LEN: usize, const RESULTS_LEN: usize>(
         &mut self,
-        instruction: u8,
-        params: [u8; PARAMS],
-    ) -> Result<[u8; RESULTS], Error<SE, PE>> {
-        let mut header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, RESULTS);
-
+        request: [u8; REQUEST_LEN],
+    ) -> Result<[u8; RESULTS_LEN], Error<SE, PE>> {
+        let mut tmp = [0u8; 16];
+        for (i, &byte) in request.iter().enumerate() {
+            tmp[i] = byte;
+        }
+        let buf = &mut tmp[..REQUEST_LEN + RESULTS_LEN];
         // `Self::transfer` manages CS for us
-        self.transfer(&mut header)?;
+        self.transfer(buf)?;
 
-        let len = header.len();
-        let mut dst = [0u8; RESULTS];
-        dst.copy_from_slice(&header[len - RESULTS..]);
+        let mut dst = [0u8; RESULTS_LEN];
+        dst.copy_from_slice(&buf[(buf.len() - RESULTS_LEN)..]);
         Ok(dst)
     }
 
     /// Reads a dynamic amount of bytes by executing `instruction` on the flash chip with `params`
-    pub fn read_unbounded<const PARAMS: usize, const DUMMY_BYTES: usize>(
+    pub fn read_unbounded<const REQUEST_LEN: usize>(
         &mut self,
-        instruction: u8,
-        params: [u8; PARAMS],
+        request: [u8; REQUEST_LEN],
         buf: &mut [u8],
     ) -> Result<(), Error<SE, PE>> {
-        let header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, 0);
         {
             self.cs_enable()?;
-            self.spi.write(&header)?;
+            self.spi.write(&request)?;
             // FIXME:
             // Make sure we dont miss bits here! If the function calls too slowly, that may happen!
             self.spi.transfer(&mut buf[..])?;
@@ -355,14 +694,11 @@ where
     }
 
     /// Writes a dynamic amount of bytes by executing `instruction` on the flash chip with `params`
-    pub fn write_unbounded<const PARAMS: usize, const DUMMY_BYTES: usize>(
+    pub fn write_unbounded<const PARAMS: usize>(
         &mut self,
-        instruction: u8,
-        params: [u8; PARAMS],
+        header: [u8; PARAMS],
         buf: &[u8],
     ) -> Result<(), Error<SE, PE>> {
-        let header = Self::prep_header::<PARAMS, DUMMY_BYTES>(instruction, params, 0);
-
         {
             self.cs_enable()?;
             self.spi.write(&header)?;
@@ -383,24 +719,8 @@ where
         self.cs.set_low().map_err(|pe| Error::Pin(pe))
     }
 
-    pub(crate) fn prep_header<const PARAMS: usize, const DUMMY_BYTES: usize>(
-        instruction: u8,
-        params: [u8; PARAMS],
-        additional_bytes: usize,
-    ) -> heapless::Vec<u8, 16> {
-        let mut header = heapless::Vec::<u8, 16>::new();
-        header.push(instruction).unwrap();
-
-        for &param in params.iter() {
-            header.push(param).unwrap();
-        }
-        for _ in 0..DUMMY_BYTES {
-            header.push(0).unwrap();
-        }
-        for _ in 0..additional_bytes {
-            header.push(0).unwrap();
-        }
-        header
+    pub(crate) fn into_inner(self) -> (SPI, CS) {
+        (self.spi, self.cs)
     }
 }
 

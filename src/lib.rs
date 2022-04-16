@@ -289,9 +289,9 @@ where
         })
     }
 
-    /// Erases a single page on the flash chip at address `page_addr`
-    pub fn erase(mut self, page_addr: u16) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>> {
-        self.get_impl().block_erase_impl(page_addr)?;
+    /// Erases 64 pages (one block) on the flash chip
+    pub fn erase_block(mut self, block_addr: u16) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().block_erase_impl(block_addr)?;
         self.get_impl().block_until_not_busy_impl()?;
         Ok(W25n512gvWD {
             inner: self.take_impl(),
@@ -522,10 +522,10 @@ where
     // Skipped bad block managment
 
     /// NEEDS BLOCK
-    pub(crate) fn block_erase_impl(&mut self, page_address: u16) -> Result<(), Error<SE, PE>> {
-        let page_address = page_address.to_be_bytes();
+    pub(crate) fn block_erase_impl(&mut self, block_address: u16) -> Result<(), Error<SE, PE>> {
+        let block_address = block_address.to_be_bytes();
         self.bus
-            .write([Commands::BLOCK_ERASE, 0, page_address[0], page_address[1]])
+            .write([Commands::BLOCK_ERASE, 0, block_address[0], block_address[1]])
     }
 
     /// Writes `buf` into the flash chip's internal memory buffer.

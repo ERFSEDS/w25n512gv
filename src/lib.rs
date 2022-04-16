@@ -154,22 +154,22 @@ where
     inner: W25n512gvImpl<SPI, CS>,
 }
 
+pub fn new<SPI, CS, SE, PE>(spi: SPI, cs: CS) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    Ok(W25n512gvWD {
+        inner: W25n512gvImpl::new(spi, cs)?,
+    })
+}
+
 pub trait W25n512gv<SPI, CS, SE, PE>: Sized
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
     type BufferType: BufferRef<SPI, CS, SE, PE>;
-
-    fn new(spi: SPI, cs: CS) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>>
-    where
-        SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
-        CS: OutputPin<Error = PE>,
-    {
-        Ok(W25n512gvWD {
-            inner: W25n512gvImpl::new(spi, cs)?,
-        })
-    }
 
     fn new_impl(inner: W25n512gvImpl<SPI, CS>) -> Self;
 

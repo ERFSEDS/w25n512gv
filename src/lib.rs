@@ -1,17 +1,13 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Used for parameterizing writable and mode status into wrapper types
-#![allow(incomplete_features, unused)]
-#![feature(adt_const_params)]
-
-extern crate embedded_hal as hal;
-
-pub use hal::spi::{MODE_0, MODE_3};
 
 use embedded_hal::blocking::delay::DelayUs;
 use embedded_hal::blocking::spi::{Transfer, Write};
 use embedded_hal::digital::v2::OutputPin;
-use tock_registers::LocalRegisterCopy;
+pub use embedded_hal::spi::{MODE_0, MODE_3};
+//FIXME: Once stm32f4xx hal compiles on nightly, we can re-add tock-registers!
+//TOCK_TODO use tock_registers::LocalRegisterCopy;
 
 pub const RAW_PAGE_SIZE: usize = 2112;
 pub const PAGE_SIZE_WITHOUT_ECC: usize = RAW_PAGE_SIZE;
@@ -49,7 +45,7 @@ where
 }
 
 pub mod regs {
-    tock_registers::register_bitfields! [
+    /*tock_registers::register_bitfields! [
         u8,
         pub Protection [
             /// Status register protect lock-0
@@ -124,10 +120,11 @@ pub mod regs {
             BUSY  OFFSET(0) NUMBITS(1) [],
         ],
     ];
+    */
 }
 
-/// Flash chip api
-pub(crate) struct W25n512gvImpl<SPI, CS>
+/// Low level flash chip api with no type protections for device/register misuse
+pub struct W25n512gvImpl<SPI, CS>
 where
     SPI: Transfer<u8> + Write<u8>,
     CS: OutputPin,
@@ -141,131 +138,98 @@ pub enum Writability {
     Disabled,
 }
 
-#[derive(PartialEq, Eq)]
-pub enum BufMode {
-    Normal,
-    Continuous,
-}
-
-pub fn new<SPI, CS, SE, PE>(
-    spi: SPI,
-    cs: CS,
-) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, { BufMode::Normal }>, Error<SE, PE>>
-where
-    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
-    CS: OutputPin<Error = PE>,
-{
-    let inner = W25n512gvImpl::new(spi, cs)?;
-    // also read id
-    W25n512gv::read_registers(inner)
-}
-
-pub struct W25n512gv<SPI, CS, const S: Writability, const M: BufMode>
+pub struct W25n512gvWE<SPI, CS>
 where
     SPI: Transfer<u8> + Write<u8>,
     CS: OutputPin,
 {
     inner: W25n512gvImpl<SPI, CS>,
-
-    configuration: LocalRegisterCopy<u8, regs::Configuration::Register>,
-    status: LocalRegisterCopy<u8, regs::Status::Register>,
-    protection: LocalRegisterCopy<u8, regs::Protection::Register>,
 }
 
-/// Impl for any read mode and any writability
-impl<SPI, CS, SE, PE, const S: Writability, const M: BufMode> W25n512gv<SPI, CS, S, M>
+pub struct W25n512gvWD<SPI, CS>
+where
+    SPI: Transfer<u8> + Write<u8>,
+    CS: OutputPin,
+{
+    inner: W25n512gvImpl<SPI, CS>,
+}
+
+pub trait W25n512gv<SPI, CS, SE, PE>: Sized
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    pub(crate) fn read_registers(mut inner: W25n512gvImpl<SPI, CS>) -> Result<Self, Error<SE, PE>> {
-        let config = inner.read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
-        let status = inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
-        let protection = inner.read_regester_impl(Addresses::PROTECTION_REGISTER)?;
+    type BufferType: BufferRef<SPI, CS, SE, PE>;
 
-        Ok(W25n512gv {
-            inner,
-            configuration: LocalRegisterCopy::new(config),
-            status: LocalRegisterCopy::new(status),
-            protection: LocalRegisterCopy::new(protection),
+    fn new(spi: SPI, cs: CS) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>>
+    where
+        SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+        CS: OutputPin<Error = PE>,
+    {
+        Ok(W25n512gvWD {
+            inner: W25n512gvImpl::new(spi, cs)?,
         })
     }
-    pub fn read_status_register(
-        &mut self,
-    ) -> Result<LocalRegisterCopy<u8, regs::Status::Register>, Error<SE, PE>> {
-        let bits = self.inner.read_regester_impl(Addresses::STATUS_REGISTER)?;
-        self.status = LocalRegisterCopy::new(bits);
-        Ok(self.status)
+
+    fn new_impl(inner: W25n512gvImpl<SPI, CS>) -> Self;
+
+    fn get_impl(&mut self) -> &mut W25n512gvImpl<SPI, CS>;
+    fn take_impl(self) -> W25n512gvImpl<SPI, CS>;
+
+    fn read_protection_register(&mut self) -> Result<u8, Error<SE, PE>> {
+        Ok(self
+            .get_impl()
+            .read_regester_impl(Addresses::STATUS_REGISTER)?)
     }
 
-    pub fn read_protection_register(
-        &mut self,
-    ) -> Result<LocalRegisterCopy<u8, regs::Protection::Register>, Error<SE, PE>> {
-        let bits = self
-            .inner
-            .read_regester_impl(Addresses::PROTECTION_REGISTER)?;
-        self.protection = LocalRegisterCopy::new(bits);
-        Ok(self.protection)
+    fn read_configuration_register(&mut self) -> Result<u8, Error<SE, PE>> {
+        Ok(self
+            .get_impl()
+            .read_regester_impl(Addresses::CONFIGURATION_REGISTER)?)
     }
 
-    pub fn read_configuration_register(
-        &mut self,
-    ) -> Result<LocalRegisterCopy<u8, regs::Configuration::Register>, Error<SE, PE>> {
-        let bits = self
-            .inner
-            .read_regester_impl(Addresses::CONFIGURATION_REGISTER)?;
-        self.configuration = LocalRegisterCopy::new(bits);
-        Ok(self.configuration)
+    fn read_status_register(&mut self) -> Result<u8, Error<SE, PE>> {
+        Ok(self
+            .get_impl()
+            .read_regester_impl(Addresses::STATUS_REGISTER)?)
     }
 
-    pub fn write_status_register(
-        &mut self,
-        status: LocalRegisterCopy<u8, regs::Status::Register>,
-    ) -> Result<(), Error<SE, PE>> {
-        self.status = status;
-        self.inner
-            .write_register_impl(Addresses::STATUS_REGISTER, status.get())
+    fn write_protection_register(&mut self, value: u8) -> Result<(), Error<SE, PE>> {
+        self.get_impl()
+            .write_register_impl(Addresses::PROTECTION_REGISTER, value)
     }
 
-    pub fn write_protection_register(
-        &mut self,
-        protec: LocalRegisterCopy<u8, regs::Protection::Register>,
-    ) -> Result<(), Error<SE, PE>> {
-        self.protection = protec;
-        self.inner
-            .write_register_impl(Addresses::PROTECTION_REGISTER, protec.get())
+    fn write_configuration_register(&mut self, value: u8) -> Result<(), Error<SE, PE>> {
+        self.get_impl()
+            .write_register_impl(Addresses::CONFIGURATION_REGISTER, value)
     }
 
-    pub fn write_configuration_register(
-        &mut self,
-        config: LocalRegisterCopy<u8, regs::Configuration::Register>,
-    ) -> Result<(), Error<SE, PE>> {
-        self.configuration = config;
-        self.inner
-            .write_register_impl(Addresses::CONFIGURATION_REGISTER, config.get())
+    fn write_status_register(&mut self, value: u8) -> Result<(), Error<SE, PE>> {
+        self.get_impl()
+            .write_register_impl(Addresses::STATUS_REGISTER, value)
     }
 
-    pub fn modify_status_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    fn modify_status_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
     where
-        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Status::Register>),
+        F: FnOnce(&mut u8),
     {
         let mut val = self.read_status_register()?;
         f(&mut val);
         self.write_status_register(val)
     }
 
-    pub fn modify_protection_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    fn modify_protection_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
     where
-        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Protection::Register>),
+        F: FnOnce(&mut u8),
     {
         let mut val = self.read_protection_register()?;
         f(&mut val);
         self.write_protection_register(val)
     }
 
-    pub fn modify_configuration_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
+    fn modify_configuration_register<F>(&mut self, f: F) -> Result<(), Error<SE, PE>>
     where
-        F: FnOnce(&mut LocalRegisterCopy<u8, regs::Configuration::Register>),
+        F: FnOnce(&mut u8),
     {
         let mut val = self.read_configuration_register()?;
         f(&mut val);
@@ -276,57 +240,38 @@ where
     ///
     /// This is the first step in reading data from the flash chip
     // TODO: Return future for more efficent waiting while we upload to the flash chip
-    pub fn read_sync(
-        mut self,
-        page_addr: u16,
-    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
-        self.inner.page_data_read_impl(page_addr)?;
-        self.inner.block_until_not_busy_impl()?;
-        Ok(BufferRef { inner: self.inner })
+    fn read_sync(mut self, page_addr: u16) -> Result<Self::BufferType, Error<SE, PE>> {
+        self.get_impl().page_data_read_impl(page_addr)?;
+        self.get_impl().block_until_not_busy_impl()?;
+        Ok(Self::BufferType::new(self.take_impl()))
     }
 
     /// Resets the chip to its default state.
     ///
     /// Consumes the device, returning the bus.
-    pub fn reset(mut self, delay: &mut impl DelayUs<u16>) -> (SPI, CS) {
+    fn reset(mut self, delay: &mut impl DelayUs<u16>) -> (SPI, CS) {
         // Make this infailable so that we can still reset in the event of an error
-        let _ = self.inner.reset_impl();
+        let _ = self.get_impl().reset_impl();
         let bus = self.into_inner();
         delay.delay_us(500);
         bus
     }
 
     /// Consumes the device, returning the bus.
-    pub fn into_inner(self) -> (SPI, CS) {
-        self.inner.bus.into_inner()
-    }
-
-    /// Returns the size of a page based on the current configuration.
-    /// Returns [`PAGE_SIZE_WITH_ECC`] when error correction is enabled and
-    /// [`PAGE_SIZE_WITHOUT_ECC`] when ECC is disabled
-    pub fn page_size(&self) -> usize {
-        match self.configuration.is_set(regs::Configuration::ECC_E) {
-            true => PAGE_SIZE_WITH_ECC,
-            false => PAGE_SIZE_WITHOUT_ECC,
-        }
+    fn into_inner(self) -> (SPI, CS) {
+        self.take_impl().bus.into_inner()
     }
 }
 
-impl<SPI, CS, SE, PE, const M: BufMode> W25n512gv<SPI, CS, { Writability::Enabled }, M>
+impl<SPI, CS, SE, PE> W25n512gvWE<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    pub fn disable_write(
-        mut self,
-    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
-        self.inner.disable_write_impl()?;
-        let status = self.read_status_register()?;
-        Ok(W25n512gv {
-            inner: self.inner,
-            configuration: self.configuration,
-            status,
-            protection: self.protection,
+    pub fn disable_write(mut self) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().disable_write_impl()?;
+        Ok(W25n512gvWD {
+            inner: self.take_impl(),
         })
     }
 
@@ -337,42 +282,92 @@ where
     pub fn upload_to_buffer_sync(
         mut self,
         data: &[u8],
-    ) -> Result<BufferRef<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
-        self.inner.load_program_data_impl(0, data)?;
-        Ok(BufferRef { inner: self.inner })
+    ) -> Result<BufferRefWE<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().load_program_data_impl(0, data)?;
+        Ok(BufferRefWE {
+            inner: self.take_impl(),
+        })
     }
 
     /// Erases a single page on the flash chip at address `page_addr`
-    pub fn erase(
-        mut self,
-        page_addr: u16,
-    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
-        self.inner.block_erase_impl(page_addr)?;
-        self.inner.block_until_not_busy_impl();
-        Ok(W25n512gv {
-            inner: self.inner,
-            configuration: self.configuration,
-            status: self.status,
-            protection: self.protection,
+    pub fn erase(mut self, page_addr: u16) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().block_erase_impl(page_addr)?;
+        self.get_impl().block_until_not_busy_impl()?;
+        Ok(W25n512gvWD {
+            inner: self.take_impl(),
         })
     }
 
     /// Erases the entire contents of the flash chip
-    pub fn erase_all(
-        mut self,
-    ) -> Result<W25n512gv<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
-        self.inner.chip_erase_impl()?;
-        self.inner.block_until_not_busy_impl();
-        Ok(W25n512gv {
-            inner: self.inner,
-            configuration: self.configuration,
-            status: self.status,
-            protection: self.protection,
+    pub fn erase_all(mut self) -> Result<W25n512gvWD<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().chip_erase_impl()?;
+        self.get_impl().block_until_not_busy_impl()?;
+        Ok(W25n512gvWD {
+            inner: self.take_impl(),
         })
     }
 }
 
-pub struct BufferRef<SPI, CS, const W: Writability, const M: BufMode>
+impl<SPI, CS, SE, PE> W25n512gv<SPI, CS, SE, PE> for W25n512gvWE<SPI, CS>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    type BufferType = BufferRefWE<SPI, CS>;
+
+    fn new_impl(inner: W25n512gvImpl<SPI, CS>) -> Self {
+        Self { inner }
+    }
+
+    fn get_impl(&mut self) -> &mut W25n512gvImpl<SPI, CS> {
+        &mut self.inner
+    }
+
+    fn take_impl(self) -> W25n512gvImpl<SPI, CS> {
+        self.inner
+    }
+}
+
+impl<SPI, CS, SE, PE> W25n512gv<SPI, CS, SE, PE> for W25n512gvWD<SPI, CS>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    type BufferType = BufferRefWD<SPI, CS>;
+
+    fn new_impl(inner: W25n512gvImpl<SPI, CS>) -> Self {
+        Self { inner }
+    }
+
+    fn get_impl(&mut self) -> &mut W25n512gvImpl<SPI, CS> {
+        &mut self.inner
+    }
+
+    fn take_impl(self) -> W25n512gvImpl<SPI, CS> {
+        self.inner
+    }
+}
+
+pub trait BufferRef<SPI, CS, SE, PE>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    type Device: W25n512gv<SPI, CS, SE, PE>;
+
+    fn new(inner: W25n512gvImpl<SPI, CS>) -> Self;
+
+    fn finish(self) -> Self::Device;
+
+    fn get_inner(&mut self) -> &mut W25n512gvImpl<SPI, CS>;
+
+    /// Reads the content of the flash chip's buffer into memory using SPI, blocking until complete
+    fn download_from_buffer_sync(&mut self, data: &mut [u8]) -> Result<(), Error<SE, PE>> {
+        self.get_inner().page_read_continous_impl(data)
+    }
+}
+
+pub struct BufferRefWE<SPI, CS>
 where
     SPI: Transfer<u8> + Write<u8>,
     CS: OutputPin,
@@ -380,58 +375,86 @@ where
     inner: W25n512gvImpl<SPI, CS>,
 }
 
-impl<SPI, CS, SE, PE, const M: BufMode> BufferRef<SPI, CS, { Writability::Enabled }, M>
+impl<SPI, CS, SE, PE> BufferRef<SPI, CS, SE, PE> for BufferRefWE<SPI, CS>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    type Device = W25n512gvWE<SPI, CS>;
+
+    fn new(inner: W25n512gvImpl<SPI, CS>) -> Self {
+        Self { inner }
+    }
+
+    fn finish(self) -> Self::Device {
+        W25n512gvWE::new_impl(self.inner)
+    }
+
+    fn get_inner(&mut self) -> &mut W25n512gvImpl<SPI, CS> {
+        &mut self.inner
+    }
+}
+
+pub struct BufferRefWD<SPI, CS>
+where
+    SPI: Transfer<u8> + Write<u8>,
+    CS: OutputPin,
+{
+    inner: W25n512gvImpl<SPI, CS>,
+}
+
+impl<SPI, CS, SE, PE> BufferRef<SPI, CS, SE, PE> for BufferRefWD<SPI, CS>
+where
+    SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
+    CS: OutputPin<Error = PE>,
+{
+    type Device = W25n512gvWD<SPI, CS>;
+
+    fn new(inner: W25n512gvImpl<SPI, CS>) -> Self {
+        Self { inner }
+    }
+
+    fn finish(self) -> W25n512gvWD<SPI, CS> {
+        W25n512gv::new_impl(self.inner)
+    }
+
+    fn get_inner(&mut self) -> &mut W25n512gvImpl<SPI, CS> {
+        &mut self.inner
+    }
+}
+
+impl<SPI, CS, SE, PE> BufferRefWE<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
     /// Writes the content of the flash chip's buffer to a page within the flash storage of the
     /// flash chip, blocking until completed
-    pub fn commit_sync(
-        mut self,
-        page_addr: u16,
-    ) -> Result<BufferRef<SPI, CS, { Writability::Disabled }, M>, Error<SE, PE>> {
+    pub fn commit_sync(mut self, page_addr: u16) -> Result<BufferRefWD<SPI, CS>, Error<SE, PE>> {
         self.inner.program_execute_impl(page_addr)?;
         self.inner.block_until_not_busy_impl()?;
-        Ok(BufferRef { inner: self.inner })
+        Ok(BufferRefWD { inner: self.inner })
     }
 }
 
-impl<SPI, CS, SE, PE, const W: Writability, const M: BufMode> BufferRef<SPI, CS, W, M>
+impl<SPI, CS, SE, PE> BufferRefWD<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    /// Reads the content of the flash chip's buffer into memory using SPI, blocking until complete
-    pub fn download_from_buffer_sync(&mut self, data: &mut [u8]) -> Result<(), Error<SE, PE>> {
-        self.inner.page_read_continous_impl(data)
-    }
-
-    pub fn finish(mut self) -> Result<W25n512gv<SPI, CS, W, M>, Error<SE, PE>> {
-        W25n512gv::read_registers(self.inner)
-    }
 }
 
-impl<SPI, CS, SE, PE, const M: BufMode> W25n512gv<SPI, CS, { Writability::Disabled }, M>
+impl<SPI, CS, SE, PE> W25n512gvWD<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
     CS: OutputPin<Error = PE>,
 {
-    pub fn enable_write(
-        mut self,
-    ) -> Result<W25n512gv<SPI, CS, { Writability::Enabled }, M>, Error<SE, PE>> {
-        self.inner.enable_write_impl()?;
-        let status = self.read_status_register()?;
-        Ok(W25n512gv {
-            inner: self.inner,
-            configuration: self.configuration,
-            status,
-            protection: self.protection,
-        })
+    pub fn enable_write(mut self) -> Result<W25n512gvWE<SPI, CS>, Error<SE, PE>> {
+        self.get_impl().enable_write_impl()?;
+        Ok(W25n512gvWE { inner: self.inner })
     }
 }
 
-/// High level implementations of the api
 impl<SPI, CS, SE, PE> W25n512gvImpl<SPI, CS>
 where
     SPI: Transfer<u8, Error = SE> + Write<u8, Error = SE>,
@@ -586,8 +609,16 @@ where
     pub(crate) fn block_until_not_busy_impl(&mut self) -> Result<(), Error<SE, PE>> {
         loop {
             let reg = self.read_regester_impl(Addresses::STATUS_REGISTER)?;
+
+            /* TOCK_TODO
             let reg = LocalRegisterCopy::<u8, regs::Status::Register>::new(reg);
             if !reg.is_set(regs::Status::BUSY) {
+                break Ok(());
+            }
+            */
+
+            // BUSY bit is at position 0, and is unset when the device is ready for commands
+            if reg & 0b0000_0001 == 0 {
                 break Ok(());
             }
         }

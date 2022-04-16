@@ -1,12 +1,10 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![feature(adt_const_params)]
 
-use core::cell::UnsafeCell;
 use core::fmt::Write;
-use core::mem::MaybeUninit;
 
+use embedded_hal::blocking;
 use embedded_hal::digital::v2::OutputPin;
 use embedded_hal::spi::{Mode, Phase, Polarity};
 use hal::pac::USART2;
@@ -49,9 +47,9 @@ fn main() -> ! {
     // HIGH_G/ACCEL PB2
     //
 
-    let sck = gpioc.pc10.into_alternate();
-    let miso = gpioc.pc11.into_alternate();
-    let mosi = gpioc.pc12.into_alternate();
+    let sck = gpioc.pc10;
+    let miso = gpioc.pc11;
+    let mosi = gpioc.pc12;
     let flash_cs = gpiob.pb13.into_push_pull_output();
 
     let pins = (sck, miso, mosi);
@@ -67,15 +65,14 @@ fn main() -> ! {
         &clocks,
     );
 
-    fn dump_buf<SPI, CS, const W: w25n512gv::Writability, const M: w25n512gv::BufMode>(
-        r: &mut BufferRef<SPI, CS, W, M>,
+    fn dump_buf<SPI, CS, SE, PE>(
+        r: &mut impl BufferRef<SPI, CS, SE, PE>,
         page: &mut [u8; w25n512gv::PAGE_SIZE_WITH_ECC],
         len: usize,
         serial: &mut impl Write,
     ) where
-        SPI: embedded_hal::blocking::spi::Transfer<u8, Error = stm32f4xx_hal::spi::Error>
-            + embedded_hal::blocking::spi::Write<u8, Error = stm32f4xx_hal::spi::Error>,
-        CS: OutputPin,
+        SPI: blocking::spi::Transfer<u8, Error = SE> + blocking::spi::Write<u8, Error = SE>,
+        CS: OutputPin<Error = PE>,
     {
         if let Err(err) = r.download_from_buffer_sync(page) {
             writeln!(serial, "Failed to dump flash buffer!");
@@ -98,7 +95,7 @@ fn main() -> ! {
     delay.delay_ms(100u32);
 
     writeln!(serial, "Initializing flash chip");
-    let flash = w25n512gv::new(spi, flash_cs)
+    let flash = w25n512gv::W25n512gv::new(spi, flash_cs)
         .map_err(|e| {
             writeln!(serial, "Flash chip failed to intialize. {e:?}");
         })
@@ -106,26 +103,19 @@ fn main() -> ! {
 
     let (spi, flash_cs) = flash.reset(&mut delay);
 
-    let mut flash = w25n512gv::new(spi, flash_cs /*, &mut delay*/)
+    let mut flash = w25n512gv::W25n512gv::new(spi, flash_cs /*, &mut delay*/)
         .map_err(|e| {
             writeln!(serial, "Flash chip failed to intialize. {e:?}");
         })
         .unwrap();
 
     flash.modify_configuration_register(|r| {
-        r.modify(
-            w25n512gv::regs::Configuration::ECC_E::SET + w25n512gv::regs::Configuration::H_DIS::SET,
-        )
+        *r |= 1 << 4; // Enable ECC
+        *r |= 1 << 0; // disable HOLD
     });
 
-    // config_val |= 1 << 4; // Enable ECC
-    // config_val |= 1; // disable HOLD
-    // flash
-    //     .write_register(Addresses::CONFIGURATION_REGISTER, config_val)
-    //     .unwrap();
-
     // Disable all protections
-    flash.modify_protection_register(|r| r.set(0));
+    flash.modify_protection_register(|r| *r = 0);
 
     writeln!(serial, "Initialized.");
 
@@ -136,7 +126,7 @@ fn main() -> ! {
     let mut page = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC];
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 64, &mut serial);
-    let flash = r.finish().unwrap();
+    let flash = r.finish();
 
     writeln!(serial, "Erasing chip...");
     let flash = flash.enable_write().unwrap();
@@ -146,7 +136,7 @@ fn main() -> ! {
 
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 64, &mut serial);
-    let flash = r.finish().unwrap().enable_write().unwrap();
+    let flash = r.finish();
 
     writeln!(serial, "writing first time");
     let mut index: u8 = 0;
@@ -157,12 +147,12 @@ fn main() -> ! {
     });
 
     let r = flash.upload_to_buffer_sync(&test_data).unwrap();
-    let flash = r.commit_sync(test_page).unwrap().finish().unwrap();
+    let flash = r.commit_sync(test_page).unwrap().finish();
 
     writeln!(serial, "after 2 increment write");
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 16, &mut serial);
-    let flash = r.finish().unwrap();
+    let flash = r.finish();
 
     let mut index: u8 = 0;
     let test_data = [0u8; w25n512gv::PAGE_SIZE_WITH_ECC].map(|_| {
@@ -177,21 +167,21 @@ fn main() -> ! {
 
     writeln!(serial, "writing second time");
     let mut r = flash.upload_to_buffer_sync(&test_data).unwrap();
-    let flash = r.commit_sync(test_page).unwrap().finish().unwrap();
+    let flash = r.commit_sync(test_page).unwrap().finish();
 
     writeln!(serial, "after normal write");
 
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 16, &mut serial);
-    let flash = r.finish().unwrap();
+    let flash = r.finish();
 
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 16, &mut serial);
-    let flash = r.finish().unwrap();
+    let flash = r.finish();
 
     let mut r = flash.read_sync(test_page).unwrap();
     dump_buf(&mut r, &mut page, 16, &mut serial);
-    let flash = r.finish().unwrap();
+    let flash = r.finish();
 
     writeln!(serial, "OK");
     loop {}

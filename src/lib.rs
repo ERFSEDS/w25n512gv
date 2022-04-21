@@ -194,6 +194,10 @@ where
             .read_regester_impl(Addresses::STATUS_REGISTER)?)
     }
 
+    fn read_jedec_id(&mut self) -> Result<JedecId, Error<SE, PE>> {
+        self.get_impl().read_jedec_id_impl()
+    }
+
     fn write_protection_register(&mut self, value: u8) -> Result<(), Error<SE, PE>> {
         self.get_impl()
             .write_register_impl(Addresses::PROTECTION_REGISTER, value)
